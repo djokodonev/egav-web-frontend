@@ -1,0 +1,9 @@
+{
+  "short_name": "SynaptaGrid",
+  "name": "SynaptaGrid.io Marketing",
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#0f1b2d",
+  "background_color": "#0f1b2d",
+  "icons": []
+}
