@@ -4,6 +4,7 @@ export type TokenResponse = {
   access_token: string;
   id_token: string;
   expires_in: number;
+  refresh_token?: string;
   refresh_expires_in?: number;
   token_type: string;
   scope?: string;
@@ -134,6 +135,24 @@ export async function exchangeCodeForTokens({
     throw new Error('Token exchange failed');
   }
 
+  const data = (await response.json()) as TokenResponse;
+  return data;
+}
+
+export async function refreshAccessToken(refreshToken: string): Promise<TokenResponse> {
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    client_id: OIDC_CLIENT_ID,
+    refresh_token: refreshToken,
+  });
+  const response = await fetch(TOKEN_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  if (!response.ok) {
+    throw new Error('Token refresh failed');
+  }
   const data = (await response.json()) as TokenResponse;
   return data;
 }

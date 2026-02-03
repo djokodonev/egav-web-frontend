@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { BrowserRouter, Link, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
+import { BrowserRouter, Link, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom';
 import './App.css';
 import {
   setAccessTokenCookie,
+  setRefreshTokenCookie,
   getAccessTokenCookie,
 } from './auth/cookie';
 import {
@@ -10,6 +11,56 @@ import {
   startAuthRedirect,
 } from './auth/oidc';
 import type { TokenResponse } from './auth/oidc';
+import { useTokenRefresh } from './hooks/useTokenRefresh';
+import { useCaptcha } from './hooks/useCaptcha';
+import { getControlPlaneBaseUrl, SCHEDULE_DEMO_PATH, CONTACT_US_PATH } from './api/usersAccounts';
+
+/** IANA timezones for demo form (common + browser default first). */
+function getTimezoneOptions(): { value: string; label: string }[] {
+  const browserTz = typeof Intl !== 'undefined' ? Intl.DateTimeFormat().resolvedOptions().timeZone : '';
+  let list: string[] = [];
+  try {
+    const intl = Intl as unknown as { supportedValuesOf?: (key: string) => string[] };
+    if (typeof intl.supportedValuesOf === 'function') {
+      list = intl.supportedValuesOf('timeZone');
+    }
+  } catch {
+    list = [];
+  }
+  const fallback = [
+    'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Sofia', 'Europe/Athens', 'Europe/Moscow',
+    'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
+    'Asia/Dubai', 'Asia/Kolkata', 'Asia/Singapore', 'Asia/Tokyo', 'Australia/Sydney',
+    'UTC',
+  ];
+  const zones = (list.length > 0 ? list : fallback).slice(0, 400);
+  const opts = zones.map((tz) => ({
+    value: tz,
+    label: tz.replace(/_/g, ' '),
+  }));
+  if (browserTz && !opts.some((o) => o.value === browserTz)) {
+    opts.unshift({ value: browserTz, label: `${browserTz.replace(/_/g, ' ')} (your timezone)` });
+  }
+  return opts;
+}
+
+/** Parse API error response (JSON with message/error_code) into a user-friendly string. */
+async function parseApiErrorMessage(res: Response, fallbackText: string): Promise<string> {
+  const text = await res.text();
+  try {
+    const data = JSON.parse(text) as { message?: string; error_code?: number };
+    if (typeof data.message === 'string' && data.message.trim()) {
+      const msg = data.message.trim();
+      if (/captcha_token.*at least 1 character/i.test(msg)) {
+        return 'Please complete the captcha before submitting.';
+      }
+      return msg;
+    }
+  } catch {
+    /* ignore */
+  }
+  return text.trim() || fallbackText;
+}
 
 type BootstrapResponse = {
   user: { guid: string; email: string; email_verified: boolean; name?: string };
@@ -25,11 +76,16 @@ type BootstrapResponse = {
 };
 
 const MARKETING_USER_KEY = 'synaptagrid_marketing_user';
+const MARKETING_USER_FETCHED_AT_KEY = 'synaptagrid_marketing_user_fetched_at_ms';
 
 function getAppBaseUrl(): string {
   const env = process.env.REACT_APP_APP_BASE_URL;
   if (env) return env;
   return `${window.location.protocol}//${window.location.hostname}:3001`;
+}
+
+function getPortalBaseUrl(): string {
+  return process.env.REACT_APP_PORTAL_BASE_URL || 'https://local-app.synaptagrid.io:3003/';
 }
 
 type CurrentUserResponse = {
@@ -48,6 +104,17 @@ function getStoredUser(): { name: string; email?: string } | null {
   }
 }
 
+function getStoredUserFetchedAtMs(): number | null {
+  try {
+    const raw = sessionStorage.getItem(MARKETING_USER_FETCHED_AT_KEY);
+    if (!raw) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchCurrentUser(): Promise<{ name: string; email?: string } | null> {
   const authnBaseUrl =
     process.env.REACT_APP_AUTHN_BASE_URL || 'https://local-app.synaptagrid.io:5005';
@@ -60,7 +127,7 @@ async function fetchCurrentUser(): Promise<{ name: string; email?: string } | nu
   try {
     const res = await fetch(`${authnBaseUrl}${mePath}`, {
       method: 'GET',
-      credentials: 'include',
+      credentials: 'omit',
       headers,
     });
     if (!res.ok) return getStoredUser();
@@ -71,6 +138,7 @@ async function fetchCurrentUser(): Promise<{ name: string; email?: string } | nu
     const user = { name, email: u.email };
     try {
       sessionStorage.setItem(MARKETING_USER_KEY, JSON.stringify(user));
+      sessionStorage.setItem(MARKETING_USER_FETCHED_AT_KEY, String(Date.now()));
     } catch {
       /* ignore */
     }
@@ -80,70 +148,504 @@ async function fetchCurrentUser(): Promise<{ name: string; email?: string } | nu
   }
 }
 
+type TopNavUser = { name: string; email?: string };
+
+function TopNav({ user: userProp, authChecked: authCheckedProp }: { user?: TopNavUser | null; authChecked?: boolean } = {}) {
+  const initialToken = getAccessTokenCookie();
+  const initialUser = initialToken ? getStoredUser() : null;
+
+  const [userState, setUserState] = useState<TopNavUser | null>(initialUser);
+  const [authCheckedState, setAuthCheckedState] = useState(() => {
+    if (!initialToken) return true;
+    return initialUser !== null;
+  });
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  const location = useLocation();
+
+  useEffect(() => {
+    // Close the mobile menu on navigation to avoid "stuck open" states.
+    setMobileMenuOpen(false);
+  }, [location.pathname]);
+
+  const hasExternalAuthState = typeof userProp !== 'undefined' || typeof authCheckedProp !== 'undefined';
+
+  useEffect(() => {
+    if (hasExternalAuthState) return;
+
+    const token = getAccessTokenCookie();
+    if (!token) {
+      setUserState(null);
+      setAuthCheckedState(true);
+      return;
+    }
+
+    const cached = getStoredUser();
+    const fetchedAt = getStoredUserFetchedAtMs();
+    const isFresh = typeof fetchedAt === 'number' && Date.now() - fetchedAt < 5 * 60 * 1000;
+    if (cached && isFresh) {
+      setUserState(cached);
+      setAuthCheckedState(true);
+      return;
+    }
+
+    let cancelled = false;
+    fetchCurrentUser().then((u) => {
+      if (!cancelled) {
+        setUserState(u);
+        setAuthCheckedState(true);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [hasExternalAuthState]);
+
+  const user = typeof userProp !== 'undefined' ? userProp : userState;
+  const authChecked = typeof authCheckedProp !== 'undefined' ? authCheckedProp : authCheckedState;
+
+  return (
+    <nav className="top-nav">
+      <Link to="/" className="top-nav-brand" aria-label="SynaptaGrid home">
+        <span className="top-nav-logo" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="24" height="24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            {/* Frame: EGAV model container */}
+            <rect x="4" y="6" width="24" height="20" rx="4" stroke="currentColor" strokeWidth="2" />
+
+            {/* Nodes inside the model */}
+            <circle cx="11" cy="16" r="2.4" stroke="currentColor" strokeWidth="2" />
+            <circle cx="20" cy="12" r="2.4" stroke="currentColor" strokeWidth="2" />
+            <circle cx="20" cy="20" r="2.4" stroke="currentColor" strokeWidth="2" />
+
+            {/* Connections (automation graph) */}
+            <path d="M13.2 14.9 L17.6 13.2" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            <path d="M13.2 17.1 L17.6 18.8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+          </svg>
+        </span>
+        <span className="top-nav-brand-text">SynaptaGrid</span>
+      </Link>
+      <button
+        type="button"
+        className="top-nav-menu-button"
+        aria-label="Open navigation menu"
+        aria-expanded={mobileMenuOpen}
+        aria-controls="top-nav-mobile-menu"
+        onClick={() => setMobileMenuOpen((v) => !v)}
+      >
+        ☰
+      </button>
+      <div className="top-nav-right">
+        <div className="top-nav-links">
+          <Link to="/egav" className="top-nav-link">EGAV</Link>
+          <Link to="/automation" className="top-nav-link">Automation</Link>
+          <Link to="/case-studies" className="top-nav-link">Case studies</Link>
+          <Link to="/contact-us" className="top-nav-link">Contact us</Link>
+          <Link to="/request-demo" className="top-nav-link top-nav-cta">Schedule your technical review</Link>
+        </div>
+        <div className="top-nav-auth" aria-label="Account">
+          {!authChecked ? (
+            <span className="top-nav-link" aria-hidden="true">&nbsp;</span>
+          ) : user ? (
+            <div className="top-nav-user">
+              <a className="top-nav-link" href={getPortalBaseUrl()}>
+                Portal
+              </a>
+              <a className="top-nav-link" href={getAppBaseUrl()}>
+                Applications
+              </a>
+              <span className="top-nav-user-name" title={user.name}>{user.name}</span>
+              <span className="top-nav-user-avatar" aria-hidden="true">
+                {user.name.charAt(0).toUpperCase()}
+              </span>
+            </div>
+          ) : (
+            <div className="top-nav-auth-actions">
+              <Link to="/login" className="top-nav-link">Login</Link>
+              <Link to="/register" className="top-nav-link top-nav-cta">Evaluate</Link>
+            </div>
+          )}
+        </div>
+      </div>
+      <div
+        id="top-nav-mobile-menu"
+        className={`top-nav-mobile-menu${mobileMenuOpen ? ' is-open' : ''}`}
+        aria-hidden={!mobileMenuOpen}
+      >
+        <div className="top-nav-mobile-links">
+          <Link to="/egav" className="top-nav-link">EGAV</Link>
+          <Link to="/automation" className="top-nav-link">Automation</Link>
+          <Link to="/case-studies" className="top-nav-link">Case studies</Link>
+          <Link to="/contact-us" className="top-nav-link">Contact us</Link>
+          <Link to="/request-demo" className="top-nav-link top-nav-cta">Schedule your technical review</Link>
+        </div>
+        <div className="top-nav-mobile-auth" aria-label="Account">
+          {!authChecked ? (
+            <span className="top-nav-link" aria-hidden="true">&nbsp;</span>
+          ) : user ? (
+            <div className="top-nav-user">
+              <a className="top-nav-link" href={getPortalBaseUrl()}>
+                Portal
+              </a>
+              <a className="top-nav-link" href={getAppBaseUrl()}>
+                Applications
+              </a>
+              <span className="top-nav-user-name" title={user.name}>{user.name}</span>
+              <span className="top-nav-user-avatar" aria-hidden="true">
+                {user.name.charAt(0).toUpperCase()}
+              </span>
+            </div>
+          ) : (
+            <div className="top-nav-auth-actions">
+              <Link to="/login" className="top-nav-link">Login</Link>
+              <Link to="/register" className="top-nav-link top-nav-cta">Evaluate</Link>
+            </div>
+          )}
+        </div>
+      </div>
+    </nav>
+  );
+}
+
 const heroStats = [
   { value: "700+", label: "Built-in activities", detail: "Google, OpenAI, and more" },
-  { value: "Isolated", label: "Per-customer data", detail: "Full tenant separation" },
-  { value: "99.9%", label: "Execution reliability", detail: "Temporal-backed" },
+  { value: "Isolated", label: "Per-customer data", detail: "Architecture you can defend" },
+  { value: "99.9%", label: "Execution reliability", detail: "Durable execution (Temporal)" },
 ];
 
 const problems = [
   {
     icon: "🔧",
-    title: "You want to add automation to your product",
-    description: "But building workflow engines, integrations, and a visual builder from scratch takes 12-18 months and a dedicated team.",
+    title: "Build vs buy: automation as a product capability",
+    description: "Building workflow engines, integrations, and a visual builder in-house takes 12–18 months and a dedicated team. You need a decision that de-risks the roadmap.",
   },
   {
     icon: "🔄",
-    title: "Your data model keeps changing",
-    description: "New document types, new fields, new relationships. Every change means developer time, migrations, and deployments.",
+    title: "Evolving data models without constant rework",
+    description: "New document types, new fields, new relationships — every schema change shouldn't mean migrations and redeploys. You need versioning and governance, not rebuilds.",
+  },
+  {
+    icon: "📋",
+    title: "Audit trail and governance for compliance",
+    description: "Compliance and security require controlled change and full auditability. Consumer tools don't offer versioning, retention, or proper RBAC for production.",
   },
   {
     icon: "📈",
-    title: "Consumer tools don't scale",
-    description: "Zapier, Make, n8n work great until you need multi-tenancy, complex conditions, or state-aware decisions.",
+    title: "Outgrowing consumer automation tools",
+    description: "Zapier, Make, n8n work until you need multi-tenancy, complex conditions, or state-aware decisions. You need an architecture that scales with your product.",
   },
   {
     icon: "💰",
-    title: "Enterprise tools cost enterprise money",
-    description: "Workato and Tray.io are powerful but built for giant budgets. You need enterprise-grade capabilities that fit your scale.",
+    title: "Enterprise capability without enterprise budget",
+    description: "Workato and Tray.io target large budgets. You need enterprise-grade governance, isolation, and reliability at a fit-for-your-scale cost.",
   },
 ];
 
 const whatItIs = {
-  headline: "Your data. Your automations. Your way.",
+  headline: "One platform. Governed data. Reliable automation.",
+  oneLiner: "Model complex data fast, govern it, then automate its lifecycle safely.",
   products: [
     {
       name: "SynaptaGrid EGAV",
-      tagline: "Dynamic data modeling",
-      description: "Define a data model → get instant CRUD APIs → get instant frontend UI. JSON Schema & JSON UI compatible. Multiple model versions, full history, restore any record to any state.",
+      tagline: "Model and store your data — on our cloud or yours",
+      description: "Use EGAV to model and store your data — on our cloud or yours. Define entity types and attribute sets; get versioned schema evolution, generated REST APIs, and dynamic CRUD frontends. No custom backend or UI per data model — so your team ships features instead of migrations. JSON Schema & JSON UI compatible; full history and restore.",
       features: [
-        "JSON Schema & JSON UI",
-        "Instant CRUD APIs + frontend",
-        "Full version history & restore",
-        "Complete audit log",
-        "Horizontal scaling (PostgreSQL)",
+        "Model & store your data — on our cloud or yours",
+        "Model the structure → versioning, APIs & CRUD out of the box",
+        "JSON Schema & JSON UI; instant CRUD APIs + frontend",
+        "Full version history & restore; complete audit log for compliance",
+        "Horizontal scaling with per-attribute-set databases",
       ],
     },
     {
       name: "SynaptaGrid Automation",
-      tagline: "Intelligent workflow orchestration",
-      description: "Connect your data and automate around it. Or just use automation standalone - bring your own data via APIs. Works both ways.",
+      tagline: "Workflows for anything — full control",
+      description: "Send your data to the automation (API, Kafka, or SNS) → we process it → you get the updates back to your system. Any API can be added: import OpenAPI, map any entity to API input and API output to any entity. Unlimited activities per workflow. Rich conditions: event attributes, entity state, time-based rules, AND/OR logic — one rule instead of many. Full control: concurrency, per-activity throttling, notifications on failure/success/stale, pause/stop/start, emergency throttle, crash prevention. Process documents, uploads, content generation, and approvals.",
       features: [
-        "State-aware automation",
-        "Complex condition logic",
-        "700+ built-in activities",
-        "Import any OpenAPI spec",
-        "DAG workflow execution",
+        "Send data in (API / Kafka / SNS) → we process → updates back to your system",
+        "Any API: add any API via OpenAPI; unlimited activities per workflow",
+        "Rich conditions: event + entity state + time-based + AND/OR — one rule, not many Zaps",
+        "Full control: concurrency, throttling, notifications, pause, stop, start, emergency throttle",
+        "State-aware automation, branching, human approvals; DAG execution & execution history",
       ],
     },
   ],
 };
 
+const egavCapabilities: Array<{
+  title: string;
+  tagline: string;
+  description: string;
+  features: string[];
+}> = [
+  {
+    title: 'Data modeling primitives',
+    tagline: 'Unlimited nested, repeatable field groups',
+    description: 'Build any data structure with nested, repeatable groups (unlimited depth) — then get compliant JSON Schema, UI schema, and generated CRUD automatically.',
+    features: [
+      'Define entity types and attribute sets',
+      'Define attributes (data types, constraints, defaults)',
+      'Optional/required fields and validation rules',
+      'Reusable attribute sets across multiple entity types',
+      'Relationships between entities (link/lookup patterns)',
+      'Nested, repeatable field groups (unlimited depth) for complex document-like structures',
+      'Support for evolving domains (new fields and structures over time)',
+    ],
+  },
+  {
+    title: 'Versioning & schema evolution',
+    tagline: 'Change safely, keep history',
+    description: 'EGAV treats your model as a governed artifact: changes are tracked, versioned, and reversible.',
+    features: [
+      'Versioned schema definitions',
+      'Backward/forward evolution strategy (introduce new fields without breaking existing consumers)',
+      'Full history of model changes',
+      'Restore/rollback to prior versions',
+      'Auditability of who changed what and when (governance-ready change trail)',
+    ],
+  },
+  {
+    title: 'Generated APIs',
+    tagline: 'CRUD without custom backend work',
+    description: 'Expose your model through generated REST endpoints so teams integrate quickly without hand-built boilerplate.',
+    features: [
+      'Instant CRUD endpoints per entity type',
+      'Consistent request/response shapes across entity types',
+      'Generated OpenAPI specs for CRUD operations (endpoints + request/response schemas)',
+      'Validation aligned with the current schema version',
+      'Listing endpoints with pagination and filtering',
+      'Stable contract evolution as schema versions change',
+    ],
+  },
+  {
+    title: 'Dynamic CRUD frontends',
+    tagline: 'UI generated from the model',
+    description: 'Avoid building and maintaining a bespoke UI for every new entity type or schema change.',
+    features: [
+      'Dynamic CRUD UI generated from schema + UI schema',
+      'Form generation, field rendering, and validation from definitions',
+      'Generated list views with filtering for rapid admin/operator workflows',
+      'Consistent admin/operator experience across entity types',
+      'Lower UI maintenance as models evolve',
+    ],
+  },
+  {
+    title: 'JSON Schema & JSON UI compatibility',
+    tagline: 'Interoperable by design',
+    description: 'Define structure and UI behavior using industry-standard JSON artifacts that tooling can understand.',
+    features: [
+      'Compliant JSON Schema output from your model (including nested, repeatable groups)',
+      'Compliant UI schema output (form rendering and UI behavior)',
+      'Schema-driven validation',
+      'Share schemas across teams and environments',
+    ],
+  },
+  {
+    title: 'Audit, compliance & governance',
+    tagline: 'Production-grade traceability',
+    description: 'Designed for regulated and compliance-heavy environments where changes and data access must be explainable.',
+    features: [
+      'Complete audit log of changes (model and data operations)',
+      'Version history and restore support',
+      'Clear separation of configuration vs customer application data',
+      'Policy-friendly approach to retention and traceability (deployment dependent)',
+    ],
+  },
+  {
+    title: 'Tenant isolation & deployment flexibility',
+    tagline: 'Your cloud or yours',
+    description: 'Run EGAV in a way that matches your customer and compliance needs—shared control plane, isolated data.',
+    features: [
+      'Customer-hosted data option (on-prem or customer cloud)',
+      'Dedicated instances where required (by customer/segment)',
+      'Per-tenant isolation patterns (data and runtime)',
+      'Clear boundary: store configuration centrally, keep app data isolated (deployment dependent)',
+    ],
+  },
+  {
+    title: 'Scalability approach',
+    tagline: 'Divide & conquer data placement',
+    description: 'Scale by splitting your model data across server sets: keep everything together, or place specific models/attribute sets on different servers for independent scaling.',
+    features: [
+      'Horizontal scaling with per-attribute-set databases',
+      'Choose where each model’s data lives: same server set or split across multiple server sets',
+      'Move/partition hot or heavy attribute sets independently (deployment dependent)',
+      'Reduce migration churn by schema-driven modeling',
+      'Operate multiple domains without multiplying bespoke services',
+    ],
+  },
+  {
+    title: 'Integration with automation',
+    tagline: 'Data + workflows',
+    description: 'EGAV pairs naturally with SynaptaGrid Automation: model data, then automate lifecycle events and business processes.',
+    features: [
+      'Use EGAV as the governed system of record for workflow inputs/outputs',
+      'Map entities to API inputs and outputs (workflow dependent)',
+      'Support document + content + approval style workflows when combined with Automation',
+    ],
+  },
+  {
+    title: 'External systems & sync',
+    tagline: 'Connect your models anywhere',
+    description: 'Connect external systems to your EGAV models: pull data out, push updates back, and run full operations via generated APIs — or use the included CRUD UI when that’s enough.',
+    features: [
+      'Integrate external systems against generated CRUD APIs',
+      'Pull model data into external systems for analytics, search, or downstream processing',
+      'Push updates back into EGAV (create/update/delete operations)',
+      'Optionally rely on the included CRUD UI for day-to-day operations',
+    ],
+  },
+  {
+    title: 'Developer & platform ergonomics',
+    tagline: 'Ship faster with less glue',
+    description: 'Reduce the long-tail cost of building platform features repeatedly for each domain team.',
+    features: [
+      'Eliminate per-model backend boilerplate',
+      'Eliminate per-model CRUD UI work',
+      'Standardized patterns across teams and environments',
+      'Faster time-to-first-feature for new data domains',
+    ],
+  },
+];
+
+const egavOrganization: Array<{
+  title: string;
+  tagline: string;
+  description: string;
+  points: string[];
+}> = [
+  {
+    title: 'Entity types',
+    tagline: 'The “things” in your domain',
+    description: 'Entity types define the kinds of records you store (e.g., Customer, Quote, Claim, Product).',
+    points: [
+      'Named domain objects you can version and govern',
+      'Each type can have multiple attribute sets (modules)',
+      'Supports relationships/links between entities',
+    ],
+  },
+  {
+    title: 'Attribute sets',
+    tagline: 'Reusable modules of fields',
+    description: 'Attribute sets are composable groups of fields you attach to entity types—shared across models and independently scalable.',
+    points: [
+      'Reuse the same field groups across multiple entity types',
+      'Version and evolve modules independently',
+      'Backed by per-attribute-set databases for scaling/placement',
+    ],
+  },
+  {
+    title: 'Fields (attributes)',
+    tagline: 'Typed + validated',
+    description: 'Fields carry types, constraints, defaults, and validation. This is the source of truth for schemas, APIs, and UI generation.',
+    points: [
+      'Data types, constraints, defaults, required/optional',
+      'Validation rules align across UI + API',
+      'Designed for evolving structures without migrations',
+    ],
+  },
+  {
+    title: 'Nested, repeatable field groups',
+    tagline: 'Unlimited structure',
+    description: 'Build document-like structures with nested sections and repeating groups at unlimited depth.',
+    points: [
+      'Repeatable groups (line items, evidence blocks, sections)',
+      'Unlimited nesting for complex shapes',
+      'Produces compliant JSON Schema + UI schema from the model',
+    ],
+  },
+  {
+    title: 'Schema artifacts',
+    tagline: 'JSON Schema + UI schema',
+    description: 'Your model yields compliant schema artifacts used for validation, rendering, and integration contracts.',
+    points: [
+      'Compliant JSON Schema output (structure + validation)',
+      'Compliant UI schema output (rendering + behavior)',
+      'Versioned alongside the model for safe evolution',
+    ],
+  },
+  {
+    title: 'Generated API surface',
+    tagline: 'CRUD + OpenAPI',
+    description: 'EGAV exposes models through generated CRUD APIs and generates OpenAPI specs including request/response schemas.',
+    points: [
+      'CRUD endpoints per entity type',
+      'Listing with pagination + filtering',
+      'Generated OpenAPI specs (endpoints + request/response schemas)',
+    ],
+  },
+  {
+    title: 'Generated CRUD UI',
+    tagline: 'Frontend included',
+    description: 'EGAV includes a dynamic CRUD frontend that renders forms and list views directly from the schemas.',
+    points: [
+      'Forms generated from schema + UI schema',
+      'List views with filtering for operations and admins',
+      'No bespoke UI per model required',
+    ],
+  },
+  {
+    title: 'Data placement (“divide & conquer”)',
+    tagline: 'Choose where model data lives',
+    description: 'Scale by placing different attribute sets on different server sets—keep everything together or split hot/heavy sets out.',
+    points: [
+      'Per-attribute-set databases enable horizontal scaling',
+      'Place attribute sets on server set 1/2/3… or separate sets',
+      'Scale the hottest parts independently (deployment dependent)',
+    ],
+  },
+  {
+    title: 'External APIs as model “options”',
+    tagline: 'Dynamic dropdowns & lookups',
+    description: 'Connect external APIs to your models so fields can offer dynamic options (e.g., dropdown values) sourced from external systems.',
+    points: [
+      'Configure option sources from external APIs (via OpenAPI-integrated endpoints)',
+      'Use external reference data to populate dropdowns / selectors',
+      'Keep UI, validation, and integrations aligned with the same model',
+    ],
+  },
+  {
+    title: 'Events (Kafka / SNS)',
+    tagline: 'Send + receive all events',
+    description: 'Publish EGAV model events (create/update/delete and more) to Kafka or SNS, and consume events back to create/update entities—event-driven integrations without bespoke glue per model.',
+    points: [
+      'Send all EGAV events to Kafka or SNS (model-driven event stream)',
+      'Consume Kafka/SNS events to create/update entities in EGAV',
+      'EGAV Automation consumes these events to run data processing workflows and write results back to EGAV',
+      'Keep external systems in sync using model-driven contracts',
+    ],
+  },
+];
+
 const differentiators = [
   {
-    title: "Self-Service Integrations",
-    description: "Users import any API via OpenAPI spec. No waiting for pre-built connectors. Activities auto-sync when APIs update. Each tenant adds exactly what they need.",
+    title: "Customer-hosted data",
+    description: "Data can reside on‑premises or in your chosen cloud. Each tenant's application data lives in a per-tenant database you can provision or operate yourself. We store only configuration — not your application data. Data does not leave your premises when you host it.",
+    icon: "🔒",
+  },
+  {
+    title: "Dedicated instances",
+    description: "Dedicated AuthN, AuthZ, EGAV, and Automation instances per customer or segment. Identity and policy traffic stay isolated; full runtime isolation and capacity for high-compliance or high-scale accounts.",
+    icon: "🏢",
+  },
+  {
+    title: "RBAC across the platform",
+    description: "Authorization applies everywhere: Control Plane, EGAV Core, and Automation. Every feature is behind role-based access. One AuthZ service, many orgs and apps — tenant admins assign roles and control who can do what.",
+    icon: "🛡️",
+  },
+  {
+    title: "Plans that fit",
+    description: "Trial, starter, pro, and enterprise tiers with clear limits and features. Custom plans available: negotiated enterprise with your limits and feature set. No fixed list — plans are data, managed via Control Plane.",
+    icon: "📋",
+  },
+  {
+    title: "Any API, unlimited activities",
+    description: "Send your data to the automation (API, Kafka, or SNS) → we process it → updates back to your system. Any API can be added via OpenAPI. No fixed activity list — unlimited activities per workflow. Activities auto-sync when APIs update.",
     icon: "🔌",
+  },
+  {
+    title: "Rich workflow conditions",
+    description: "Event attributes, entity state, time-based rules, AND/OR logic — one rule handles complex scenarios that would need many Zaps elsewhere. State-aware: query live entity data mid-execution.",
+    icon: "🔍",
   },
   {
     title: "State-Aware Automation",
@@ -153,7 +655,7 @@ const differentiators = [
   {
     title: "Complete Data Isolation",
     description: "Each customer gets their own isolated environment. Separate databases, separate workflows, separate configurations. Your data never mixes.",
-    icon: "🏢",
+    icon: "🔐",
   },
   {
     title: "DAG Workflow Execution",
@@ -161,14 +663,14 @@ const differentiators = [
     icon: "⚡",
   },
   {
-    title: "Enterprise Reliability",
-    description: "Built on Temporal for durable execution. Workflows survive failures, retry intelligently, and maintain state. Complete audit trail for compliance.",
-    icon: "🛡️",
+    title: "Total control over automation",
+    description: "Concurrency, per-activity throttling, per-source limits. Notifications on failure, success, or stale updates. Pause, stop, start, emergency throttle. Crash prevention (auto pause/resume on resource thresholds). No black box.",
+    icon: "🎛️",
   },
   {
-    title: "Self-Hosted or On-Premise",
-    description: "Choose where data lives: our managed multi-zone deployments or your own infrastructure. We do not deploy our code to your environment. Your data stays in your network.",
-    icon: "🔒",
+    title: "Enterprise Reliability",
+    description: "Built on Temporal for durable execution. Workflows survive failures, retry intelligently, and maintain state. Complete audit trail for compliance.",
+    icon: "✓",
   },
   {
     title: "White-Label Ready",
@@ -177,33 +679,56 @@ const differentiators = [
   },
 ];
 
+const planTiers = [
+  {
+    tier: "Trial",
+    tagline: "Prove value quickly",
+    description: "Personal evaluation with smallest quotas, minimal automation, and short retention. Ideal for trying EGAV and Automation before committing.",
+  },
+  {
+    tier: "Starter",
+    tagline: "First production workload",
+    description: "Small teams and limited schema scale. Uploads, basic audit, and limited automation schedules. Your first real deployment.",
+  },
+  {
+    tier: "Pro",
+    tagline: "Serious production",
+    description: "Multiple workflows, higher usage, bulk operations, advanced search, longer retention. Approvals, branching, and operational visibility.",
+  },
+  {
+    tier: "Enterprise",
+    tagline: "Compliance + scale + control",
+    description: "Configurable or custom limits, long retention, multi-environment, dedicated runtime options. Region choice, customer-hosted data, and dedicated instances when you need them.",
+  },
+];
+
 const useCases = [
   {
     icon: "🚀",
     title: "SaaS Platforms",
-    scenario: "Add automation features to your product",
-    description: "Give your customers the ability to automate workflows within your platform. White-label the entire experience.",
+    scenario: "Automation as a product capability",
+    description: "Add workflow automation to your product with multi-tenant, white-label delivery. One platform decision instead of a long build.",
     outcome: "Ship in weeks, not quarters",
   },
   {
     icon: "📄",
-    title: "Document Processing",
-    scenario: "OCR, extraction, approval workflows",
-    description: "Process documents with AI, route for approval, sync to external systems. All triggered by upload events.",
-    outcome: "10,000+ documents daily",
+    title: "Document Processing Pipeline",
+    scenario: "Automate your data workflows",
+    description: "Governed document pipelines: AI extraction, approval flows, sync to external systems. Audit trail and retention built in.",
+    outcome: "Scale without operational risk",
   },
   {
     icon: "🔗",
     title: "Integration Hub",
     scenario: "Connect any system to any system",
-    description: "REST, SOAP, GraphQL, databases. Configure connections once, use everywhere. No waiting for pre-built connectors.",
+    description: "REST, SOAP, GraphQL, databases. Configure once, use everywhere. No vendor lock-in on connectors.",
     outcome: "New integrations in hours",
   },
   {
     icon: "⚙️",
     title: "Operations Automation",
     scenario: "Business process orchestration",
-    description: "Order fulfillment, inventory sync, customer onboarding. Complex multi-step processes with conditional logic.",
+    description: "Order fulfillment, inventory sync, customer onboarding. Durable execution and visibility so operations can own the process.",
     outcome: "Replace manual processes",
   },
 ];
@@ -260,13 +785,13 @@ const comparisonTable = [
   },
   {
     feature: "User imports own APIs",
-    synaptagrid: "OpenAPI auto-sync",
+    synaptagrid: "Any API via OpenAPI; unlimited activities",
     zapier: "No",
     make: "No",
     n8n: "Manual code",
   },
   {
-    feature: "Self-hosted or on-premise",
+    feature: "Self-hosted or on‑premises",
     synaptagrid: "Customer-hosted data",
     zapier: "No",
     make: "No",
@@ -282,6 +807,16 @@ const comparisonTable = [
 ];
 
 const techStack = [
+  { 
+    name: "React", 
+    role: "Frontend",
+    logo: "https://cdn.jsdelivr.net/gh/devicons/devicon/icons/react/react-original.svg"
+  },
+  { 
+    name: "Keycloak", 
+    role: "Bridges our platform with your users",
+    logo: "https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/keycloak.svg"
+  },
   { 
     name: "Temporal", 
     role: "Workflow orchestration",
@@ -312,6 +847,23 @@ const techStack = [
     role: "Deployment",
     logo: "https://cdn.jsdelivr.net/gh/devicons/devicon/icons/kubernetes/kubernetes-plain.svg"
   },
+  { 
+    name: "AWS", 
+    role: "Hosting",
+    logo: "https://cdn.jsdelivr.net/gh/devicons/devicon/icons/amazonwebservices/amazonwebservices-original-wordmark.svg"
+  },
+];
+
+const keycloakFeatures = [
+  { title: "Single Sign-On (SSO)", description: "Your users sign in once and access all connected applications. Single sign-out supported." },
+  { title: "OpenID Connect, OAuth 2.0, SAML 2.0", description: "Standard protocols so your apps and services plug into your existing identity strategy." },
+  { title: "Identity brokering & social login", description: "Connect to your IdP or social providers (Google, GitHub, etc.) so your users use the logins they already have." },
+  { title: "User federation", description: "Your LDAP or Active Directory; custom user storage so we don't hold a copy of your directory." },
+  { title: "Centralized management", description: "Admin console for apps, users, roles, permissions, sessions. Account console so users manage profile, password, 2FA." },
+  { title: "Authorization services", description: "Fine-grained permissions when you need more than roles." },
+  { title: "Multi-tenancy", description: "Realms per tenant, brand, or environment so each of your customers can have their own identity boundary." },
+  { title: "Two-factor authentication (2FA)", description: "OTP, WebAuthn, and other second factors for your users." },
+  { title: "Client adapters", description: "Libraries and adapters for Java, JavaScript, Node, and more so your stack integrates easily." },
 ];
 
 const integrations = [
@@ -355,22 +907,297 @@ const integrations = [
 
 const targetAudience = [
   {
-    icon: "🚀",
-    who: "SaaS Founders",
-    need: "Add automation to your product without building from scratch",
-    message: "White-label ready. Multi-tenant. Ship automation features in weeks.",
+    icon: "📋",
+    who: "Compliance-driven organizations",
+    need: "Auditability and controlled change",
+    message: "Full audit trail, versioning, retention, and RBAC. Govern who changes what and when.",
   },
   {
-    icon: "⚙️",
-    who: "Platform Teams",
-    need: "Replace fragile point-to-point integrations",
-    message: "One platform for all automation. State-aware. Enterprise reliable.",
+    icon: "🔗",
+    who: "Integration-heavy teams",
+    need: "Brittle or limited external APIs",
+    message: "Total control over APIs: concurrency, notifications on failure/success/stale, pause/stop/start. SSO and role-based access.",
   },
   {
-    icon: "🤝",
-    who: "Integration Partners",
-    need: "Build repeatable solutions for clients",
-    message: "Configure once, deploy to many tenants. Full customization per client.",
+    icon: "📐",
+    who: "Teams with complex, evolving data",
+    need: "Can't keep rebuilding schemas",
+    message: "Define entity types and attribute sets; get versioned evolution, APIs, and CRUD without custom code.",
+  },
+  {
+    icon: "🏢",
+    who: "Enterprises",
+    need: "Dev/stage/prod and operational governance",
+    message: "Multi-environment, dedicated instances, customer-hosted data. Plans that scale from trial to enterprise.",
+  },
+];
+
+const caseStudies = [
+  {
+    slug: "financial-services",
+    audience: "Compliance-driven organizations",
+    sector: "Financial services",
+    summary: "A regulated lender needed full auditability for document workflows and approvals without slowing down product delivery.",
+    challenge: "The team was building document processing and approval workflows (KYC, contracts, underwriting) but couldn't meet compliance requirements with point solutions. They needed a full audit trail, retention policies, versioning, and role-based access so that who changed what and when was always traceable. Custom builds would have taken 12–18 months and tied up engineering.",
+    solution: "They adopted SynaptaGrid for governed document pipelines: AI extraction, approval flows, and sync to external systems. RBAC, versioning, and retention are built in. Workflows run as DAGs with human-in-the-loop steps and conditional branches, so business logic stays in one place while satisfying audit and architecture review.",
+    outcome: "They shipped compliant document workflows in weeks instead of quarters. Full audit trail and retention are in place; they passed architecture and compliance review. The team can add new document types and approval paths without custom code.",
+    quote: "We needed to move fast without cutting corners on compliance. SynaptaGrid gave us governed pipelines and auditability out of the box.",
+  },
+  {
+    slug: "saas-operations",
+    audience: "Integration-heavy teams",
+    sector: "SaaS operations",
+    summary: "An operations team was drowning in brittle point-to-point integrations and had no visibility when external APIs failed.",
+    challenge: "The company relied on dozens of integrations—CRM, billing, support, internal services—each wired with custom scripts or one-off connectors. When an API changed or failed, they found out from customer complaints. There was no single place to see run history, retry logic, or concurrency limits. Adding a new integration meant weeks of work and more fragile code.",
+    solution: "They consolidated on SynaptaGrid as their automation layer. Any API can be added via OpenAPI; workflows are DAGs with parallel execution, conditional steps, and gated steps. They set concurrency and per-activity throttling, and get notifications on failure, success, or stale runs. Pause, stop, and start give them control when something goes wrong.",
+    outcome: "New integrations go live in hours instead of weeks. They have full visibility into run history and failures, and can throttle or pause without deploying code. Operations owns the process instead of depending on engineering for every change.",
+    quote: "One platform replaced our patchwork of scripts. We finally have visibility and control over every integration.",
+  },
+  {
+    slug: "product-data-platform",
+    audience: "Teams with complex, evolving data",
+    sector: "Product & data platform",
+    summary: "A product team’s schema changes required custom code and long release cycles every time the data model evolved.",
+    challenge: "The product relied on a rich, evolving data model—entities, attributes, and relationships that changed as the business grew. Every schema change meant database migrations, API updates, and front-end work. Release cycles stretched to months. They couldn’t let non-engineers define new entity types or attributes without risking production.",
+    solution: "They introduced SynaptaGrid’s data modeling (EGAV) alongside their automation. Entity types and attribute sets are defined in the platform; versioned evolution handles schema changes without big-bang migrations. They get APIs and CRUD for each entity type without writing custom code. Workflows can react to entity state and event attributes, so automation and data stay in sync.",
+    outcome: "Schema evolution is now a configuration change, not a multi-week release. Product and operations can add entity types and attributes within guardrails. APIs and automation stay aligned with the data model.",
+    quote: "We stopped treating every schema change as an engineering project. The platform handles evolution and we focus on product.",
+  },
+  {
+    slug: "multi-tenant-b2b",
+    audience: "Enterprises",
+    sector: "Multi-tenant B2B",
+    summary: "A B2B vendor needed strict dev/stage/prod isolation and customer-hosted data for high-compliance accounts.",
+    challenge: "They sell into regulated and enterprise accounts. Some customers require data to stay in their own environment; others need guaranteed isolation between tenants. The team needed multi-environment support (dev, stage, prod), dedicated instances for high-compliance or high-scale customers, and a licensing model that could scale from trial to enterprise without re-architecting.",
+    solution: "They use SynaptaGrid’s multi-tenant architecture with dedicated instances and customer-hosted data options. Identity and policy traffic are isolated per customer or segment; runtime isolation is clear. Plans scale from trial through starter, pro, and enterprise, with optional custom plans. They manage everything from a single control plane while meeting each customer’s compliance and hosting requirements.",
+    outcome: "They onboard enterprise and regulated customers without custom deployments. Trial and starter tiers use shared infrastructure; high-compliance accounts get dedicated instances or customer-hosted data. The same platform serves every segment.",
+    quote: "We needed one platform that could do trials, scale-ups, and locked-down enterprise. SynaptaGrid’s plans and isolation model made it possible.",
+  },
+  {
+    slug: "custom-objects-saas",
+    audience: "Teams with complex, evolving data",
+    sector: "B2B SaaS (custom objects)",
+    summary: "A SaaS product needed customer-specific data models (nested, repeatable structures) without turning every onboarding into a migration project.",
+    challenge: "Enterprise customers demanded custom objects and deeply nested, repeatable field groups (think: forms, checklists, line items, and sub-sections). The product team couldn’t keep shipping migrations, bespoke APIs, and bespoke UIs for each customer. They also needed compliant JSON Schema and UI schema so external tooling and validations stayed aligned.",
+    solution: "They adopted EGAV to model entities with unlimited nested, repeatable groups and generate compliant JSON Schema + UI schema. EGAV generated CRUD APIs and a full CRUD frontend (forms + listing with filtering), while external systems integrated via OpenAPI specs produced from the same models.",
+    outcome: "They onboarded new customers in days instead of weeks. Schema changes became versioned configuration updates; APIs and UI updated automatically. Product shipped more domain features instead of rebuilding CRUD.",
+    quote: "EGAV let us offer true custom objects without the migration treadmill — and our APIs stayed documented via OpenAPI automatically.",
+  },
+  {
+    slug: "documents-line-items",
+    audience: "Compliance-driven organizations",
+    sector: "Insurance & claims",
+    summary: "A claims workflow required complex, repeatable document structures (line items and nested evidence) with full auditability.",
+    challenge: "Claims data included repeating line items, nested evidence blocks, and changing requirements by region. Teams were stuck between rigid relational schemas and brittle JSON blobs. They needed a model that could evolve safely, produce a compliant schema for validation, and preserve a full audit trail.",
+    solution: "They modeled claims and attachments in EGAV using nested, repeatable field groups, then exposed them through generated CRUD APIs (with OpenAPI specs) and used the built-in CRUD UI for operations. Versioning and restore supported governance; audit logging provided traceability.",
+    outcome: "They moved from ad-hoc JSON to governed, versioned models. Validation became consistent across services, and compliance review was simplified with clear audit trails and restore capability.",
+    quote: "We finally had a flexible model that still felt governed. Nested structures became first-class instead of a constant workaround.",
+  },
+  {
+    slug: "data-placement-scale-out",
+    audience: "Enterprises",
+    sector: "High-scale platforms",
+    summary: "A platform team scaled a growing domain by splitting model data across server sets (“divide & conquer”) instead of re-architecting storage.",
+    challenge: "A subset of models grew much faster than the rest (hot datasets and large attribute sets). Scaling the whole database cluster for every growth spike was expensive and risky. They needed flexibility to place different parts of the model on different server sets without changing how teams used the APIs.",
+    solution: "They used EGAV’s per-attribute-set database approach and configured model data placement across multiple server sets: some attribute sets stayed co-located; hot/heavy sets were moved to separate server sets for independent scaling. APIs remained generated and consistent; operations continued to use the same CRUD and listing/filtering experience.",
+    outcome: "They scaled the hottest workloads independently, reduced blast radius, and avoided repeated storage redesigns. Teams kept shipping features while infrastructure scaled behind the scenes.",
+    quote: "Being able to split the model by server set was the breakthrough — we scaled the hot parts without dragging the whole system along.",
+  },
+  {
+    slug: "forms-checklists-builder",
+    audience: "Product teams & designers",
+    sector: "Forms / checklists / inspections",
+    summary: "A product team shipped a form + checklist builder with unlimited nested repeatable sections, without building custom schema tooling or CRUD per template.",
+    challenge: "Users needed dynamic templates: sections, sub-sections, repeating groups, and conditional fields. The team tried hand-rolled JSON with brittle validation and a UI that constantly broke when templates changed. They needed compliant JSON Schema + UI schema, generated CRUD UI, and a reliable listing/filtering experience for operators.",
+    solution: "They modeled templates and submissions in EGAV using unlimited nested, repeatable field groups. EGAV produced compliant JSON Schema and UI schema, generated CRUD APIs (with OpenAPI specs), and a full CRUD frontend with listing and filtering — keeping templates and runtime validation aligned.",
+    outcome: "Designers shipped new templates weekly without migrations. Validation became consistent across systems, and operations gained a stable admin UI for submissions and audits.",
+    quote: "Nested repeatables were non-negotiable. EGAV made them first-class — and the schema/UI stayed compliant automatically.",
+  },
+  {
+    slug: "cpq-quotes-line-items",
+    audience: "Product teams & designers",
+    sector: "CPQ / quotes / billing",
+    summary: "A CPQ product modeled quotes with complex repeating line items and nested pricing details, while keeping APIs and UI generation in sync.",
+    challenge: "Quotes required repeating line items, nested discount rules, and evolving fields per customer segment. Every change previously meant DB migrations and coordinated API/UI releases. They also needed integration-ready APIs for downstream ERP and billing systems.",
+    solution: "They used EGAV to model the quote structure with nested repeatable groups and version it safely. EGAV generated CRUD APIs and OpenAPI specs (request/response schemas included), plus a CRUD UI with listing and filtering for sales ops and finance teams.",
+    outcome: "Schema evolution moved from quarterly releases to controlled configuration changes. Integrations consumed stable OpenAPI docs, and internal teams used the generated UI for day-to-day operations.",
+    quote: "We stopped rebuilding the same quote CRUD every quarter — EGAV kept structure, APIs, and UI aligned.",
+  },
+  {
+    slug: "product-catalog-configurator",
+    audience: "Product teams & designers",
+    sector: "Catalogs / configurators",
+    summary: "A team built a flexible product catalog and configurator where product structures evolved continuously, without constant migrations.",
+    challenge: "Products had variable attributes, nested option groups, bundles, and customer-specific fields. A rigid relational schema created constant migrations; a JSON blob approach lacked governance and validation. They needed a way to evolve safely and keep UIs consistent across products.",
+    solution: "They hosted product models in EGAV: nested structures were modeled as repeatable groups; schemas were versioned; JSON Schema + UI schema were generated for validation and rendering. EGAV provided CRUD APIs (OpenAPI documented) and a CRUD UI with listing/filtering for catalog operations.",
+    outcome: "Teams shipped new catalog structures quickly while keeping governance and validation. Operators managed catalog data through a consistent UI, and downstream systems integrated via generated APIs.",
+    quote: "EGAV gave us a catalog that can evolve forever — without the migration treadmill.",
+  },
+  {
+    slug: "master-data-admin",
+    audience: "Operations & customer success",
+    sector: "Internal admin systems",
+    summary: "Ops teams managed governed reference data and customer configuration via generated CRUD UI instead of engineering tickets.",
+    challenge: "Support and ops needed to manage reference datasets (plans, limits, mappings, settings) and customer-specific configuration. The old approach required engineers to add admin endpoints and UI screens per dataset. They needed a safe, auditable workflow with listing/filtering.",
+    solution: "They modeled admin datasets in EGAV, enabling versioned evolution and auditability. EGAV generated CRUD APIs and a full CRUD frontend with listing and filtering, allowing ops to manage data within guardrails while keeping changes traceable.",
+    outcome: "Ops resolved configuration requests in minutes, not days. Engineering focused on product features rather than building one-off admin tools.",
+    quote: "The generated CRUD UI became our operations console — governed, searchable, and fast.",
+  },
+  {
+    slug: "integration-hub-openapi-egav",
+    audience: "Platform & integration teams",
+    sector: "Integration hub",
+    summary: "A platform team exposed EGAV models as a stable integration surface: CRUD APIs + OpenAPI specs, plus bidirectional sync with external systems.",
+    challenge: "Multiple downstream systems needed the same entities, but every integration required bespoke mapping and undocumented endpoints. The team needed a consistent API contract with request/response schemas, plus the ability to pull/push data across systems safely.",
+    solution: "They hosted the source-of-truth models in EGAV and used generated CRUD APIs with generated OpenAPI specs. External systems pulled data out and pushed updates back (full operations), while operators used the included CRUD UI for manual exceptions and audits.",
+    outcome: "Integrations became repeatable and self-documenting. Teams onboarded new external systems faster and reduced integration drift with schema-driven contracts.",
+    quote: "OpenAPI from the model was huge — every system could integrate consistently without bespoke docs.",
+  },
+];
+
+const egavUseCases = [
+  {
+    icon: "🧩",
+    title: "Custom objects (configurable SaaS)",
+    scenario: "Customer-specific data models",
+    description: "Offer customer-defined entities and fields with unlimited nested repeatable groups, and keep schema/UI/APIs aligned automatically.",
+    outcome: "Ship custom objects without migrations",
+    caseStudySlug: "custom-objects-saas",
+  },
+  {
+    icon: "📝",
+    title: "Forms & checklists builder",
+    scenario: "Templates → submissions",
+    description: "Build sections, sub-sections, and repeatable groups at any depth, then generate compliant JSON Schema/UI plus CRUD UI and listing/filtering.",
+    outcome: "New templates weekly, governed",
+    caseStudySlug: "forms-checklists-builder",
+  },
+  {
+    icon: "🧾",
+    title: "CPQ quotes & line items",
+    scenario: "Repeatable commercial structures",
+    description: "Model quotes with repeating line items and nested pricing rules; version it safely; expose OpenAPI-documented CRUD for downstream systems.",
+    outcome: "Evolve quote models safely",
+    caseStudySlug: "cpq-quotes-line-items",
+  },
+  {
+    icon: "🛒",
+    title: "Catalogs & configurators",
+    scenario: "Evolving product structures",
+    description: "Host flexible product models with nested option groups and bundles; generate schemas, UI, and CRUD, plus listing/filtering for ops.",
+    outcome: "Evolve catalogs without migrations",
+    caseStudySlug: "product-catalog-configurator",
+  },
+  {
+    icon: "🛠️",
+    title: "Internal admin & master data",
+    scenario: "Ops-managed configuration",
+    description: "Model reference data and configuration with auditability, then give ops a generated CRUD UI with listing/filtering.",
+    outcome: "Fewer engineering tickets",
+    caseStudySlug: "master-data-admin",
+  },
+  {
+    icon: "🔌",
+    title: "Integration hub",
+    scenario: "Model-driven contracts",
+    description: "Expose EGAV models through generated CRUD APIs and generated OpenAPI specs, and sync data in/out of external systems.",
+    outcome: "Faster, consistent integrations",
+    caseStudySlug: "integration-hub-openapi-egav",
+  },
+  {
+    icon: "⚡",
+    title: "Scale-out by data placement",
+    scenario: "Divide & conquer",
+    description: "Place different attribute sets on different server sets to scale hot models independently, without changing how teams use the APIs/UI.",
+    outcome: "Independent scaling per domain",
+    caseStudySlug: "data-placement-scale-out",
+  },
+  {
+    icon: "🧾",
+    title: "Document-like structures",
+    scenario: "Line items + nested evidence",
+    description: "Model document-shaped data (claims, invoices, applications) with repeatables and governance, plus compliant schema outputs.",
+    outcome: "Governed, auditable documents",
+    caseStudySlug: "documents-line-items",
+  },
+];
+
+const egavAutomationOrganization: Array<{
+  title: string;
+  tagline: string;
+  description: string;
+  points: string[];
+}> = [
+  {
+    title: 'Visual workflow builder',
+    tagline: 'Steps chained into a DAG',
+    description: 'Design workflows visually by chaining steps (activities), adding conditions, parallel branches, and human approvals.',
+    points: [
+      'Steps = activity nodes you can chain into pipelines',
+      'Parallel branches, AND/OR conditions, wait-all gates',
+      'State-aware workflows: query EGAV entities (or your own data) mid-execution',
+    ],
+  },
+  {
+    title: 'Activities catalog',
+    tagline: '700+ built-in + bring your own',
+    description: 'Choose from a large activity catalog (email, AI, data processing, SaaS APIs) or add your own activities and any external API-accessible service.',
+    points: [
+      'Pick from 700+ activities (and growing)',
+      'Add your own activities (custom code or wrappers)',
+      'Any external API-accessible service can become an activity via OpenAPI',
+    ],
+  },
+  {
+    title: 'External systems management',
+    tagline: 'Your integrations registry',
+    description: 'Manage integrations and APIs in one place: import OpenAPI, configure auth/connection details, and expose them as activities.',
+    points: [
+      'Import/manage APIs via OpenAPI',
+      'Configure connection and authentication per external system',
+      'Reuse the same integration across many workflows',
+    ],
+  },
+  {
+    title: 'Entities (EGAV) / Your data',
+    tagline: 'The data your workflows operate on',
+    description: 'Automation can run on your own data (API/Kafka/SNS inputs) and can also natively integrate with EGAV entities when you use EGAV.',
+    points: [
+      'Send your own events/data in via API, Kafka, or SNS',
+      'When EGAV is used, entity state can drive branching and decisions',
+      'Write back updates/results to your systems and (optionally) EGAV',
+    ],
+  },
+  {
+    title: 'Mappings',
+    tagline: 'Connect entities ↔ activities',
+    description: 'Map your data (and/or EGAV entities) to activity inputs and map activity outputs back into your data (and/or EGAV). These mappings are then used to build workflows quickly.',
+    points: [
+      'Map entity fields to API/activity inputs',
+      'Map API/activity outputs back to entity fields',
+      'Reuse mappings across multiple workflows',
+    ],
+  },
+  {
+    title: 'Events (Kafka / SNS)',
+    tagline: 'Trigger and sync',
+    description: 'Send and receive events via Kafka or SNS. When EGAV is used, you can stream all EGAV events; Automation consumes events to start workflows and keep systems in sync.',
+    points: [
+      'Send events to Kafka or SNS (your data stream)',
+      'When EGAV is used: stream all EGAV events to Kafka or SNS',
+      'Consume Kafka/SNS events to create/update EGAV entities or your own systems',
+      'Automation consumes events to run data processing workflows and trigger emails/AI calls',
+    ],
+  },
+  {
+    title: 'Operations & reliability',
+    tagline: 'Control, visibility, governance',
+    description: 'Run workflows with durability, retries, throttling, and clear operational controls so automation can be a product capability.',
+    points: [
+      'Execution history, retries, and durable state',
+      'Concurrency and per-activity throttling',
+      'Notifications on failure/success/stale; pause/stop/start controls',
+    ],
   },
 ];
 
@@ -379,7 +1206,10 @@ function WorkflowVisualization() {
   return (
     <div className="dag-workflow">
       <div className="dag-header">
-        <span className="dag-title">Document Processing Pipeline</span>
+        <div className="dag-header-title">
+          <span className="dag-title">Document Processing Pipeline</span>
+          <span className="dag-subtitle">Automate your data workflows</span>
+        </div>
         <span className="dag-status running">Running</span>
       </div>
       
@@ -503,7 +1333,7 @@ function WorkflowVisualization() {
         <div className="dag-node activity pending human">
           <div className="node-icon">👤</div>
           <div className="node-content">
-            <span className="node-label">Human Task</span>
+            <span className="node-label">Human in the Loop</span>
             <span className="node-name">Manual Review</span>
           </div>
           <div className="node-status pending">○</div>
@@ -551,9 +1381,34 @@ function WorkflowVisualization() {
   );
 }
 
+const HERO_SVG_SCROLL_FACTOR = 0.06;
+/** Gravity: dots pull toward mouse. Strength and max pull in viewBox units. */
+const HERO_GRAVITY_STRENGTH = 1200;
+const HERO_GRAVITY_SOFTEN = 100;
+const HERO_GRAVITY_MAX_PULL = 28;
+
+/** Hero dots in SVG order: cx, cy, r (viewBox units). */
+const HERO_DOTS: { cx: number; cy: number; r: number }[] = [
+  { cx: 180, cy: 120, r: 3 }, { cx: 320, cy: 180, r: 2.5 }, { cx: 480, cy: 100, r: 4 },
+  { cx: 620, cy: 200, r: 2 }, { cx: 780, cy: 140, r: 3.5 }, { cx: 920, cy: 220, r: 2 },
+  { cx: 1050, cy: 160, r: 3 }, { cx: 220, cy: 280, r: 2 }, { cx: 400, cy: 320, r: 3 },
+  { cx: 560, cy: 380, r: 2.5 }, { cx: 720, cy: 300, r: 2 }, { cx: 860, cy: 360, r: 3 },
+  { cx: 1000, cy: 400, r: 2 }, { cx: 300, cy: 440, r: 2.5 }, { cx: 500, cy: 480, r: 2 },
+  { cx: 680, cy: 460, r: 3 }, { cx: 840, cy: 500, r: 2 },
+];
+/** Path edges as [fromIndex, toIndex] into HERO_DOTS. */
+const HERO_PATH_EDGES: [number, number][] = [
+  [0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [0, 7], [1, 8], [2, 8], [8, 9], [3, 10], [9, 10],
+  [10, 11], [4, 11], [11, 12], [7, 13], [8, 13], [13, 14], [9, 14], [14, 15], [10, 15], [15, 16], [11, 16],
+];
+
 function LandingPage() {
   const [user, setUser] = useState<{ name: string; email?: string } | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  const heroRef = useRef<HTMLElement | null>(null);
+  const heroSvgRef = useRef<SVGSVGElement | null>(null);
+  const [heroMouse, setHeroMouse] = useState<{ x: number; y: number } | null>(null);
+  const [heroScrollY, setHeroScrollY] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -568,46 +1423,108 @@ function LandingPage() {
     };
   }, []);
 
+  useEffect(() => {
+    const hero = heroRef.current;
+    const svg = heroSvgRef.current;
+    if (!hero || !svg) return;
+    const onMouseMove = (e: MouseEvent) => {
+      const rect = hero.getBoundingClientRect();
+      if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) {
+        setHeroMouse(null);
+        return;
+      }
+      const pt = svg.createSVGPoint();
+      pt.x = e.clientX;
+      pt.y = e.clientY;
+      const ctm = svg.getScreenCTM();
+      if (!ctm) return;
+      const svgPt = pt.matrixTransform(ctm.inverse());
+      setHeroMouse({ x: svgPt.x, y: svgPt.y });
+    };
+    const onMouseLeave = () => setHeroMouse(null);
+    hero.addEventListener('mousemove', onMouseMove);
+    hero.addEventListener('mouseleave', onMouseLeave);
+    return () => {
+      hero.removeEventListener('mousemove', onMouseMove);
+      hero.removeEventListener('mouseleave', onMouseLeave);
+    };
+  }, []);
+
+  useEffect(() => {
+    const onScroll = () => setHeroScrollY(window.scrollY);
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+
+  const pulledDots = useMemo(() => {
+    if (!heroMouse) return HERO_DOTS.map((d) => ({ ...d, cx: d.cx, cy: d.cy }));
+    return HERO_DOTS.map((dot) => {
+      const dx = heroMouse.x - dot.cx;
+      const dy = heroMouse.y - dot.cy;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const pull = Math.min(HERO_GRAVITY_MAX_PULL, HERO_GRAVITY_STRENGTH / (dist + HERO_GRAVITY_SOFTEN));
+      const shiftX = (dx / dist) * pull;
+      const shiftY = (dy / dist) * pull;
+      return { ...dot, cx: dot.cx + shiftX, cy: dot.cy + shiftY };
+    });
+  }, [heroMouse]);
+
+  const heroSvgScrollTransform = `translate(0, ${heroScrollY * HERO_SVG_SCROLL_FACTOR}px)`;
+
   return (
     <div className="app">
-      <nav className="top-nav">
-        <Link to="/" className="top-nav-brand">SynaptaGrid</Link>
-        <div className="top-nav-right">
-          {!authChecked ? (
-            <span className="top-nav-link" aria-hidden="true">&nbsp;</span>
-          ) : user ? (
-            <div className="top-nav-user">
-              <a className="top-nav-link" href={getAppBaseUrl()}>
-                App
-              </a>
-              <span className="top-nav-user-name">{user.name}</span>
-              <span className="top-nav-user-avatar" aria-hidden="true">
-                {user.name.charAt(0).toUpperCase()}
-              </span>
-            </div>
-          ) : (
-            <>
-              <Link to="/login" className="top-nav-link">Login</Link>
-              <Link to="/register" className="top-nav-link top-nav-cta">Start Free</Link>
-            </>
-          )}
+      <TopNav user={user} authChecked={authChecked} />
+      <header className="hero" id="top" ref={heroRef}>
+        <div className="hero-bg-svg" aria-hidden="true">
+          <svg ref={heroSvgRef} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 600" fill="none" preserveAspectRatio="xMidYMid slice">
+            <g style={{ transform: heroSvgScrollTransform }}>
+              <defs>
+                <linearGradient id="heroLineGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stopColor="rgba(59,130,246,0.06)" />
+                  <stop offset="50%" stopColor="rgba(139,92,246,0.08)" />
+                  <stop offset="100%" stopColor="rgba(59,130,246,0.06)" />
+                </linearGradient>
+                <linearGradient id="heroNodeGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                  <stop offset="0%" stopColor="rgba(59,130,246,0.12)" />
+                  <stop offset="100%" stopColor="rgba(139,92,246,0.08)" />
+                </linearGradient>
+                <pattern id="heroGrid" width="60" height="60" patternUnits="userSpaceOnUse">
+                  <path d="M 60 0 L 0 0 0 60" fill="none" stroke="rgba(255,255,255,0.02)" strokeWidth="0.5" />
+                </pattern>
+              </defs>
+              <rect width="100%" height="100%" fill="url(#heroGrid)" />
+              {pulledDots.map((dot, i) => (
+                <circle key={i} cx={dot.cx} cy={dot.cy} r={dot.r} fill="url(#heroNodeGrad)" />
+              ))}
+              {HERO_PATH_EDGES.map(([a, b], i) => {
+                const w = i < 6 ? (i % 2 === 0 ? 0.8 : 0.6) : (i % 2 === 0 ? 0.6 : 0.5);
+                const o = i < 6 ? (i % 2 === 0 ? 0.7 : 0.6) : (i % 2 === 0 ? 0.6 : 0.5);
+                return (
+                  <path
+                    key={i}
+                    d={`M ${pulledDots[a].cx} ${pulledDots[a].cy} L ${pulledDots[b].cx} ${pulledDots[b].cy}`}
+                    stroke="url(#heroLineGrad)"
+                    strokeWidth={w}
+                    strokeOpacity={o}
+                  />
+                );
+              })}
+            </g>
+          </svg>
         </div>
-      </nav>
-      <header className="hero" id="top">
         <div className="hero-content">
           <p className="eyebrow">Automation infrastructure for SaaS</p>
-          <h1>Build your own automation platform.<br/>Offer it to your customers.</h1>
+          <h1>Platform strategy without the 18‑month build.</h1>
           <p className="hero-subtitle">
-            Dynamic data modeling + intelligent workflow automation. 
-            Multi-tenant from day one. White-label ready. 
-            Add automation to your product in weeks, not years.
+            Governed data modeling and durable workflows for SaaS. Send events via API, Kafka, or SNS, process them reliably, and write results back—multi-tenant and white-label by design. Use EGAV to model and store complex data (cloud or customer-hosted) with versioning, generated APIs, and dynamic CRUD UI. Ship in weeks.
           </p>
           <div className="hero-actions">
             <Link className="primary-button" to="/request-demo">
-              Request Demo
+              Schedule your technical review
             </Link>
             <a className="secondary-button" href="#how-it-works">
-              How It Works
+              See the platform
             </a>
           </div>
           <div className="hero-metrics">
@@ -626,9 +1543,9 @@ function LandingPage() {
         {/* The Problem */}
         <section className="section">
           <div className="section-header">
-            <h2>The problem</h2>
+            <h2>Decisions you're facing</h2>
             <p>
-              Every growing platform hits these walls.
+              These trade-offs show up on every platform roadmap.
             </p>
           </div>
           <div className="problems-grid">
@@ -649,7 +1566,7 @@ function LandingPage() {
           <div className="section-header">
             <h2>{whatItIs.headline}</h2>
             <p>
-              Use both together or just what you need. Full flexibility.
+              Use both together or adopt incrementally. Architecture that fits your roadmap.
             </p>
           </div>
           <div className="products-grid">
@@ -663,6 +1580,26 @@ function LandingPage() {
                     <li key={feature}>{feature}</li>
                   ))}
                 </ul>
+                {product.name.toLowerCase().includes('egav') && (
+                  <div className="product-actions">
+                    <Link className="secondary-button" to="/egav">
+                      Learn more
+                    </Link>
+                    <Link className="primary-button" to="/request-demo">
+                      Schedule your technical review
+                    </Link>
+                  </div>
+                )}
+                {product.name.toLowerCase().includes('automation') && (
+                  <div className="product-actions">
+                    <Link className="secondary-button" to="/egav-automation">
+                      Learn more
+                    </Link>
+                    <Link className="primary-button" to="/request-demo">
+                      Schedule your technical review
+                    </Link>
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -673,27 +1610,27 @@ function LandingPage() {
               <div className="mode-icon">🔗</div>
               <div className="mode-content">
                 <h4>Full Platform</h4>
-                <p>Define a model, get instant APIs and UI. Then automate around your data. Workflows trigger on changes, update records, sync everywhere.</p>
+                <p>Use EGAV to model and store your data — on our cloud or yours. Define a model, get instant APIs and UI, then run workflows: add any API, map entities to inputs and outputs, and operate governed pipelines for documents, uploads, content generation, and approvals.</p>
                 <div className="mode-flow">
-                  <span>Define Model</span>
+                  <span>EGAV: model & store (our cloud or yours)</span>
                   <span className="flow-arrow">→</span>
                   <span>Instant APIs + UI</span>
                   <span className="flow-arrow">→</span>
-                  <span>Automate</span>
+                  <span>Workflows for anything</span>
                 </div>
               </div>
             </div>
             <div className="usage-mode">
               <div className="mode-icon">⚡</div>
               <div className="mode-content">
-                <h4>Automation Only</h4>
-                <p>Already have your data? Just use the automation engine. Connect via APIs, import OpenAPI specs, run workflows.</p>
+                <h4>Workflows for anything</h4>
+                <p>Send your data to the automation (API, Kafka, or SNS) → we process it → you get the updates back to your system. Any API via OpenAPI; unlimited activities. Rich conditions and full operational control, with support for documents, uploads, content generation, and approvals.</p>
                 <div className="mode-flow">
-                  <span>Your APIs</span>
+                  <span>Send data in (API / Kafka / SNS)</span>
                   <span className="flow-arrow">→</span>
-                  <span>Import OpenAPI</span>
+                  <span>We process</span>
                   <span className="flow-arrow">→</span>
-                  <span>Automate</span>
+                  <span>Updates back to your system</span>
                 </div>
               </div>
             </div>
@@ -705,15 +1642,36 @@ function LandingPage() {
           <div className="section-header">
             <h2>What makes it different</h2>
             <p>
-              Not just another automation tool. Infrastructure for building automation into your product.
+              Any API, unlimited activities, rich workflow conditions, and full control over automation — infrastructure for building automation into your product.
             </p>
           </div>
           <div className="differentiators-grid">
             {differentiators.map((diff) => (
               <div className="differentiator-card" key={diff.title}>
                 <span className="diff-icon">{diff.icon}</span>
-                <h3>{diff.title}</h3>
-                <p>{diff.description}</p>
+                <div className="diff-content">
+                  <h3>{diff.title}</h3>
+                  <p>{diff.description}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* Plans and tiers */}
+        <section className="section alt" id="plans">
+          <div className="section-header">
+            <h2>Plans that scale with your organization</h2>
+            <p>
+              Trial to enterprise. Clear tiers and optional custom plans — choose the right fit for scope and budget.
+            </p>
+          </div>
+          <div className="plans-grid">
+            {planTiers.map((plan) => (
+              <div className="plan-tier-card" key={plan.tier}>
+                <h3>{plan.tier}</h3>
+                <p className="plan-tagline">{plan.tagline}</p>
+                <p className="plan-description">{plan.description}</p>
               </div>
             ))}
           </div>
@@ -722,16 +1680,16 @@ function LandingPage() {
         {/* Comparison Table */}
         <section className="section alt">
           <div className="section-header">
-            <h2>How it compares</h2>
+            <h2>Evaluate against alternatives</h2>
             <p>
-              We're not trying to replace your existing tools. We're for when you outgrow them.
+              Compare capabilities when you're choosing a platform — we fit where you've outgrown consumer tools.
             </p>
           </div>
           <div className="comparison-table-wrapper">
             <table className="comparison-table">
               <thead>
                 <tr>
-                  <th>Capability</th>
+                  <th>Criteria</th>
                   <th className="highlight">SynaptaGrid</th>
                   <th>Zapier</th>
                   <th>Make</th>
@@ -756,9 +1714,9 @@ function LandingPage() {
         {/* Use Cases */}
         <section className="section">
           <div className="section-header">
-            <h2>Built for these scenarios</h2>
+            <h2>Where it fits your roadmap</h2>
             <p>
-              From SaaS automation to enterprise integration.
+              Use cases that align with product and platform strategy — SaaS automation to enterprise integration.
             </p>
           </div>
           <div className="use-cases-grid">
@@ -777,10 +1735,10 @@ function LandingPage() {
         {/* Workflow Visualization */}
         <section className="section alt" id="workflow">
           <div className="section-header">
-            <h2>See it in action</h2>
+            <h2>See the platform in action</h2>
             <p>
-              A real DAG workflow: parallel execution, conditional branches, human tasks.
-              One rule handles what would require 8+ Zaps elsewhere.
+              DAG-like execution with parallel steps, conditional branches, gated approvals, and human-in-the-loop workflows.
+              One workflow replaces many point-to-point automations.
             </p>
           </div>
           <WorkflowVisualization />
@@ -791,7 +1749,7 @@ function LandingPage() {
           <div className="section-header">
             <h2>700+ built-in activities</h2>
             <p>
-              Full Google and OpenAI integrations included. Need more? Import any API via OpenAPI spec.
+              Google and OpenAI included. Extend with any API via OpenAPI — no waiting on vendor roadmaps.
             </p>
           </div>
           <div className="integrations-grid">
@@ -850,7 +1808,7 @@ function LandingPage() {
           <div className="section-header">
             <h2>Who it's for</h2>
             <p>
-              SynaptaGrid is infrastructure, not a consumer tool.
+              Teams that need governance, compliance, and scale without betting the roadmap on a long build.
             </p>
           </div>
           <div className="audience-grid">
@@ -863,14 +1821,17 @@ function LandingPage() {
               </div>
             ))}
           </div>
+          <p className="section-cta-link">
+            <Link to="/case-studies">Read case studies →</Link>
+          </p>
         </section>
 
         {/* Tech Stack */}
         <section className="section">
           <div className="section-header">
-            <h2>Built on proven technology</h2>
+            <h2>Stack you can rely on</h2>
             <p>
-              Enterprise-grade infrastructure you can trust.
+              We host on AWS. Proven, enterprise-grade components — React, Keycloak, Temporal, PostgreSQL, and more. Lower risk, easier to defend in architecture review.
             </p>
           </div>
           <div className="tech-grid">
@@ -882,23 +1843,37 @@ function LandingPage() {
               </div>
             ))}
           </div>
+
+          <div className="keycloak-features">
+            <h3>Keycloak: bridge between our system and your users</h3>
+            <p className="keycloak-features-intro">
+              We use Keycloak to connect our platform to your users and your identity stack. You get the well-known features you expect from a modern IdP.
+            </p>
+            <div className="keycloak-features-grid">
+              {keycloakFeatures.map((f) => (
+                <div className="keycloak-feature-card" key={f.title}>
+                  <h4>{f.title}</h4>
+                  <p>{f.description}</p>
+                </div>
+              ))}
+            </div>
+          </div>
         </section>
 
         {/* Final CTA */}
         <section className="section cta">
           <div>
-            <h2>Ready to own your automation?</h2>
+            <h2>Ready to evaluate?</h2>
             <p>
-              Stop paying per task. Stop waiting for pre-built connectors. 
-              Build automation into your product with SynaptaGrid.
+              Schedule your technical review. See the platform, discuss your architecture, and get a clear recommendation for your use case.
             </p>
           </div>
           <div className="cta-actions">
             <Link className="primary-button" to="/request-demo">
-              Request Demo
+              Schedule your technical review
             </Link>
             <Link className="secondary-button" to="/register">
-              Start Free Trial
+              Evaluate the platform
             </Link>
           </div>
         </section>
@@ -906,22 +1881,329 @@ function LandingPage() {
 
       <footer className="footer">
         <p>SynaptaGrid — Automation infrastructure for SaaS</p>
-        <p className="footer-sub">Dynamic data modeling. Intelligent workflows. Multi-tenant. White-label ready.</p>
+        <p className="footer-sub">Governed data. Reliable automation. Multi-tenant. White-label. Deployment-flexible.</p>
+        <p className="footer-links">
+          <Link to="/contact-us">Contact us</Link>
+          <Link to="/request-demo">Schedule your technical review</Link>
+        </p>
       </footer>
     </div>
   );
 }
 
+const TIMEZONE_OPTIONS = getTimezoneOptions();
+
+function formatPreferredTime(dateStr: string, timeStr: string): string {
+  if (!dateStr || !timeStr) return '';
+  const d = new Date(`${dateStr}T${timeStr}`);
+  if (Number.isNaN(d.getTime())) return `${dateStr} ${timeStr}`;
+  const day = d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+  const time = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
+  return `${day} at ${time}`;
+}
+
 function DemoRequestPage() {
+  const captcha = useCaptcha();
+  const [submitting, setSubmitting] = useState(false);
+  const [submitMessage, setSubmitMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const today = useMemo(() => {
+    const t = new Date();
+    return t.toISOString().slice(0, 10);
+  }, []);
+  const [formData, setFormData] = useState({
+    name: '',
+    email: '',
+    company: '',
+    preferred_date: '',
+    preferred_time_slot: '09:00',
+    timezone: (typeof Intl !== 'undefined' ? (Intl.DateTimeFormat().resolvedOptions().timeZone ?? '') : '') || 'UTC',
+    role: '',
+    use_case: '',
+    notes: '',
+  });
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
+    const { name, value } = e.target;
+    setFormData((prev) => ({ ...prev, [name]: value }));
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitMessage(null);
+    let token: string | null = null;
+    if (captcha.captchaEnabled) {
+      token = await captcha.getToken('schedule_demo');
+    }
+    const hasToken = typeof token === 'string' && token.trim().length > 0;
+    if (!hasToken) {
+      setSubmitMessage({
+        type: 'error',
+        text: captcha.captchaEnabled
+          ? 'Please complete the captcha before submitting.'
+          : 'Captcha is required but not available. Please refresh the page and try again.',
+      });
+      return;
+    }
+    const preferredTimeStr = formatPreferredTime(formData.preferred_date, formData.preferred_time_slot);
+    if (!formData.preferred_date || !preferredTimeStr) {
+      setSubmitMessage({ type: 'error', text: 'Please select a date and time for your technical review.' });
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const notesParts = [
+        formData.role && `Role: ${formData.role}`,
+        formData.use_case && `Use case: ${formData.use_case}`,
+        formData.notes,
+      ].filter(Boolean);
+      const body = {
+        name: formData.name,
+        email: formData.email,
+        company: formData.company,
+        preferred_time: preferredTimeStr,
+        timezone: formData.timezone,
+        notes: notesParts.length ? notesParts.join('\n\n') : undefined,
+        captcha_token: token!.trim(),
+      };
+      const res = await fetch(`${getControlPlaneBaseUrl()}${SCHEDULE_DEMO_PATH}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'omit',
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const message = await parseApiErrorMessage(res, 'Something went wrong. Please try again.');
+        setSubmitMessage({ type: 'error', text: message });
+        captcha.reset();
+        return;
+      }
+      setSubmitMessage({ type: 'success', text: 'Thanks! We\'ll be in touch soon.' });
+      setFormData((prev) => ({ ...prev, name: '', email: '', company: '', preferred_date: '', preferred_time_slot: '09:00', notes: '', role: '', use_case: '' }));
+      captcha.reset();
+    } catch (err) {
+      setSubmitMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Something went wrong. Please try again.',
+      });
+      captcha.reset();
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
     <div className="app">
+      <TopNav />
       <header className="hero hero-compact">
         <div className="hero-content">
-          <p className="eyebrow">Let's talk</p>
-          <h1>See SynaptaGrid in action</h1>
+          <p className="eyebrow">Schedule your technical review</p>
+          <h1>See the platform with your team</h1>
           <p className="hero-subtitle">
-            We'll walk through the platform, discuss your use case, 
-            and show you how to add automation to your product.
+            We'll walk through the platform, discuss your architecture and use case,
+            and show how SynaptaGrid fits your roadmap.
+          </p>
+          <Link className="secondary-button" to="/">
+            Back to overview
+          </Link>
+        </div>
+      </header>
+
+      <main>
+        <section className="section form-section form-section-demo">
+          <div className="section-header">
+            <h2>Schedule your technical review</h2>
+            <p>Tell us your use case and we'll show how SynaptaGrid fits your architecture and plans.</p>
+          </div>
+          {captcha.loading && <p className="form-note">Loading form...</p>}
+          {captcha.error && <p className="form-note form-error">{captcha.error}</p>}
+          {submitMessage?.type === 'success' && (
+            <div className="form-success-banner" role="alert">
+              <span className="form-success-icon" aria-hidden="true">✓</span>
+              <span>{submitMessage.text}</span>
+            </div>
+          )}
+          <form className="form form-demo" onSubmit={handleSubmit}>
+            <div className="form-row form-row-2">
+              <label className="form-field">
+                <span className="form-label">Full name *</span>
+                <input type="text" name="name" value={formData.name} onChange={handleChange} required maxLength={200} placeholder="Your name" />
+              </label>
+              <label className="form-field">
+                <span className="form-label">Work email *</span>
+                <input type="email" name="email" value={formData.email} onChange={handleChange} required placeholder="you@company.com" />
+              </label>
+            </div>
+            <label className="form-field">
+              <span className="form-label">Company *</span>
+              <input type="text" name="company" value={formData.company} onChange={handleChange} required maxLength={200} placeholder="Your company" />
+            </label>
+            <div className="form-group">
+              <span className="form-group-title">Preferred demo time</span>
+              <div className="form-row form-row-2">
+                <label className="form-field">
+                  <span className="form-label">Date *</span>
+                  <input
+                    type="date"
+                    name="preferred_date"
+                    value={formData.preferred_date}
+                    onChange={handleChange}
+                    required
+                    min={today}
+                    aria-label="Preferred date"
+                  />
+                </label>
+                <label className="form-field">
+                  <span className="form-label">Time *</span>
+                  <input
+                    type="time"
+                    name="preferred_time_slot"
+                    value={formData.preferred_time_slot}
+                    onChange={handleChange}
+                    required
+                    min="06:00"
+                    max="22:00"
+                    step="900"
+                    aria-label="Preferred time"
+                  />
+                </label>
+              </div>
+              <p className="form-hint">We’ll reach out to confirm. Business hours only.</p>
+            </div>
+            <label className="form-field">
+              <span className="form-label">Your timezone *</span>
+              <select
+                name="timezone"
+                value={formData.timezone}
+                onChange={handleChange}
+                required
+                className="form-select-timezone"
+                aria-label="Timezone"
+              >
+                {!formData.timezone && <option value="">Select timezone...</option>}
+                {TIMEZONE_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="form-row form-row-2">
+              <label className="form-field">
+                <span className="form-label">Role *</span>
+                <input type="text" name="role" value={formData.role} onChange={handleChange} required placeholder="e.g. CTO, VP Engineering" />
+              </label>
+              <label className="form-field">
+                <span className="form-label">What are you building?</span>
+                <select name="use_case" value={formData.use_case} onChange={handleChange}>
+                  <option value="">Select use case...</option>
+                  <option value="saas_automation">Add automation to my SaaS product</option>
+                  <option value="integration_platform">Build an integration platform</option>
+                  <option value="document_processing">Document processing workflows</option>
+                  <option value="operations">Internal operations automation</option>
+                  <option value="other">Other</option>
+                </select>
+              </label>
+            </div>
+            <label className="form-field">
+              <span className="form-label">Tell us more about your needs</span>
+              <textarea name="notes" rows={4} value={formData.notes} onChange={handleChange} placeholder="What problems are you trying to solve? What have you tried?" maxLength={4000} />
+            </label>
+            {submitMessage && submitMessage.type === 'error' && (
+              <p className="form-message form-message-error">
+                {submitMessage.text}
+              </p>
+            )}
+            <button className="primary-button form-submit" type="submit" disabled={submitting || captcha.loading}>
+              {submitting ? 'Sending...' : 'Schedule your technical review'}
+            </button>
+            {captcha.captchaEnabled && (
+              <p className="form-note form-captcha-badge">This form is protected by reCAPTCHA.</p>
+            )}
+          </form>
+        </section>
+      </main>
+    </div>
+  );
+}
+
+function ContactUsPage() {
+  const captcha = useCaptcha();
+  const [submitting, setSubmitting] = useState(false);
+  const [submitMessage, setSubmitMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [formData, setFormData] = useState({
+    name: '',
+    email: '',
+    company: '',
+    message: '',
+  });
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
+    const { name, value } = e.target;
+    setFormData((prev) => ({ ...prev, [name]: value }));
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitMessage(null);
+    let token: string | null = null;
+    if (captcha.captchaEnabled) {
+      token = await captcha.getToken('contact_us');
+    }
+    const hasToken = typeof token === 'string' && token.trim().length > 0;
+    if (!hasToken) {
+      setSubmitMessage({
+        type: 'error',
+        text: captcha.captchaEnabled
+          ? 'Please complete the captcha before submitting.'
+          : 'Captcha is required but not available. Please refresh the page and try again.',
+      });
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const body = {
+        name: formData.name,
+        email: formData.email,
+        company: formData.company,
+        message: formData.message,
+        source_page: window.location.pathname || undefined,
+        captcha_token: token!.trim(),
+      };
+      const res = await fetch(`${getControlPlaneBaseUrl()}${CONTACT_US_PATH}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'omit',
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const message = await parseApiErrorMessage(res, 'Something went wrong. Please try again.');
+        setSubmitMessage({ type: 'error', text: message });
+        captcha.reset();
+        return;
+      }
+      setSubmitMessage({ type: 'success', text: 'Thanks! We\'ll get back to you soon.' });
+      setFormData({ name: '', email: '', company: '', message: '' });
+      captcha.reset();
+    } catch (err) {
+      setSubmitMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Something went wrong. Please try again.',
+      });
+      captcha.reset();
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="app">
+      <TopNav />
+      <header className="hero hero-compact">
+        <div className="hero-content">
+          <p className="eyebrow">Technical and sales inquiries</p>
+          <h1>Contact us</h1>
+          <p className="hero-subtitle">
+            Questions about architecture, pricing, or fit? We typically respond within one business day.
           </p>
           <Link className="secondary-button" to="/">
             Back to overview
@@ -932,44 +2214,45 @@ function DemoRequestPage() {
       <main>
         <section className="section form-section">
           <div className="section-header">
-            <h2>Request your demo</h2>
-            <p>Tell us what you're building. We'll show you how SynaptaGrid fits.</p>
+            <h2>Send a message</h2>
+            <p>We typically respond within one business day.</p>
           </div>
-          <form className="form" method="post" action="/api/demo-request">
+          {captcha.loading && <p className="form-note">Loading form...</p>}
+          {captcha.error && <p className="form-note form-error">{captcha.error}</p>}
+          {submitMessage?.type === 'success' && (
+            <div className="form-success-banner" role="alert">
+              <span className="form-success-icon" aria-hidden="true">✓</span>
+              <span>{submitMessage.text}</span>
+            </div>
+          )}
+          <form className="form" onSubmit={handleSubmit}>
             <label>
-              Full name *
-              <input type="text" name="full_name" required />
+              Name *
+              <input type="text" name="name" value={formData.name} onChange={handleChange} required maxLength={200} />
             </label>
             <label>
-              Work email *
-              <input type="email" name="email" required />
+              Email *
+              <input type="email" name="email" value={formData.email} onChange={handleChange} required />
             </label>
             <label>
               Company *
-              <input type="text" name="company" required />
+              <input type="text" name="company" value={formData.company} onChange={handleChange} required maxLength={200} />
             </label>
             <label>
-              Role
-              <input type="text" name="role" placeholder="e.g., CTO, VP Engineering, Product Lead" />
+              Message *
+              <textarea name="message" rows={5} value={formData.message} onChange={handleChange} required placeholder="How can we help?" maxLength={4000} />
             </label>
-            <label>
-              What are you building?
-              <select name="use_case">
-                <option value="">Select your primary use case...</option>
-                <option value="saas_automation">Add automation to my SaaS product</option>
-                <option value="integration_platform">Build an integration platform</option>
-                <option value="document_processing">Document processing workflows</option>
-                <option value="operations">Internal operations automation</option>
-                <option value="other">Other</option>
-              </select>
-            </label>
-            <label>
-              Tell us more about your needs
-              <textarea name="message" rows={5} placeholder="What problems are you trying to solve? What have you tried?" />
-            </label>
-            <button className="primary-button" type="submit">
-              Request Demo
+            {submitMessage && submitMessage.type === 'error' && (
+              <p className="form-message form-message-error">
+                {submitMessage.text}
+              </p>
+            )}
+            <button className="primary-button form-submit" type="submit" disabled={submitting || captcha.loading}>
+              {submitting ? 'Sending...' : 'Send message'}
             </button>
+            {captcha.captchaEnabled && (
+              <p className="form-note form-captcha-badge">This form is protected by reCAPTCHA.</p>
+            )}
           </form>
         </section>
       </main>
@@ -977,9 +2260,349 @@ function DemoRequestPage() {
   );
 }
 
+function EgavPage() {
+  const egav = whatItIs.products.find((p) => p.name.toLowerCase().includes('egav'));
+  const features = Array.isArray(egav?.features) ? (egav?.features ?? []) : [];
+  return (
+    <div className="app">
+      <TopNav />
+
+      <header className="hero hero-compact">
+        <div className="hero-content">
+          <p className="eyebrow">Product</p>
+          <h1>SynaptaGrid EGAV</h1>
+          <p className="hero-subtitle">
+            Model and store your data — on our cloud or yours. Versioned schema evolution, generated APIs,
+            and dynamic CRUD frontends.
+          </p>
+          <div className="hero-actions">
+            <Link className="primary-button" to="/request-demo">
+              Schedule your technical review
+            </Link>
+            <Link className="secondary-button" to="/register">
+              Evaluate
+            </Link>
+          </div>
+        </div>
+      </header>
+
+      <main>
+        <section className="section">
+          <div className="section-header">
+            <h2>What EGAV is</h2>
+            <p>
+              Flexible entity and attribute modeling with governance. Define entity types and attribute sets,
+              then ship changes safely with versioning and full history.
+            </p>
+          </div>
+          <div className="product-card">
+            <h3>{egav?.name ?? 'SynaptaGrid EGAV'}</h3>
+            <p className="product-tagline">{egav?.tagline ?? 'Model and store your data — on our cloud or yours'}</p>
+            <p>{egav?.description ?? 'EGAV helps you model and store complex data without rebuilding APIs and UIs for every schema change.'}</p>
+            {features.length > 0 && (
+              <ul>
+                {features.map((feature) => (
+                  <li key={feature}>{feature}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </section>
+
+        <section className="section alt">
+          <div className="section-header">
+            <h2>How EGAV is organized</h2>
+            <p>
+              EGAV is built from a small set of composable building blocks. Model once, then get schemas, APIs, UI, events, and scale knobs out of the same source of truth.
+            </p>
+          </div>
+          <div className="products-grid">
+            {egavOrganization.map((part) => (
+              <div className="product-card" key={part.title}>
+                <h3>{part.title}</h3>
+                <p className="product-tagline">{part.tagline}</p>
+                <p>{part.description}</p>
+                <ul>
+                  {part.points.map((point) => (
+                    <li key={point}>{point}</li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="section alt">
+          <div className="section-header">
+            <h2>Everything EGAV includes</h2>
+            <p>
+              A complete, governed data modeling platform: define the model, evolve it safely, and expose it via generated APIs and UI.
+            </p>
+          </div>
+          <div className="products-grid">
+            {egavCapabilities.map((capability) => (
+              <div className="product-card" key={capability.title}>
+                <h3>{capability.title}</h3>
+                <p className="product-tagline">{capability.tagline}</p>
+                <p>{capability.description}</p>
+                <ul>
+                  {capability.features.map((feature) => (
+                    <li key={feature}>{feature}</li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="section">
+          <div className="section-header">
+            <h2>EGAV use cases</h2>
+            <p>
+              Each use case below is a full case study with a dedicated page.
+            </p>
+          </div>
+          <div className="use-cases-grid">
+            {egavUseCases.map((useCase) => (
+              <Link
+                key={useCase.title}
+                to={`/case-studies/${useCase.caseStudySlug}`}
+                className="use-case-card use-case-card-link"
+              >
+                <div className="use-case-icon">{useCase.icon}</div>
+                <h3>{useCase.title}</h3>
+                <p className="scenario">{useCase.scenario}</p>
+                <p className="description">{useCase.description}</p>
+                <span className="outcome-badge">{useCase.outcome}</span>
+              </Link>
+            ))}
+          </div>
+        </section>
+
+        <section className="section alt">
+          <div className="section-header">
+            <h2>How teams use EGAV</h2>
+            <p>
+              Adopt EGAV as your core data layer, or introduce it for evolving domains where schema churn is the norm.
+            </p>
+          </div>
+          <div className="usage-modes">
+            <div className="usage-mode">
+              <div className="mode-icon">🧩</div>
+              <div className="mode-content">
+                <h4>Model → API → UI</h4>
+                <p>
+                  Define entities and attribute sets, then get generated REST APIs and CRUD frontends without custom
+                  backend or UI work per data model.
+                </p>
+                <div className="mode-flow">
+                  <span>Define entity types</span>
+                  <span className="flow-arrow">→</span>
+                  <span>Version schema</span>
+                  <span className="flow-arrow">→</span>
+                  <span>Generated APIs</span>
+                  <span className="flow-arrow">→</span>
+                  <span>Dynamic CRUD UI</span>
+                </div>
+              </div>
+            </div>
+            <div className="usage-mode">
+              <div className="mode-icon">🧾</div>
+              <div className="mode-content">
+                <h4>Governance & audit</h4>
+                <p>
+                  Keep full version history, restore when needed, and maintain a complete audit log for compliance.
+                  Designed for production governance, not ad-hoc consumer tooling.
+                </p>
+                <div className="mode-flow">
+                  <span>Version history</span>
+                  <span className="flow-arrow">→</span>
+                  <span>Restore</span>
+                  <span className="flow-arrow">→</span>
+                  <span>Audit log</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="section cta">
+          <div>
+            <h2>See EGAV on your domain</h2>
+            <p>
+              Walk through your data model and how EGAV can generate APIs and UI with governance and isolation.
+            </p>
+          </div>
+          <div className="cta-actions">
+            <Link className="primary-button" to="/request-demo">
+              Schedule your technical review
+            </Link>
+            <Link className="secondary-button" to="/contact-us">
+              Contact us
+            </Link>
+          </div>
+        </section>
+      </main>
+
+      <footer className="footer">
+        <p>SynaptaGrid — Automation infrastructure for SaaS</p>
+        <p className="footer-sub">Governed data. Reliable automation. Multi-tenant. White-label.</p>
+        <p className="footer-links">
+          <Link to="/contact-us">Contact us</Link>
+          <Link to="/request-demo">Schedule your technical review</Link>
+        </p>
+      </footer>
+    </div>
+  );
+}
+
+function AutomationPage() {
+  const automation = whatItIs.products.find((p) => p.name.toLowerCase().includes('automation'));
+  const features = Array.isArray(automation?.features) ? (automation?.features ?? []) : [];
+
+  const automationDiffTitles = new Set([
+    'Any API, unlimited activities',
+    'Rich workflow conditions',
+    'Total control over automation',
+    'DAG Workflow Execution',
+    'Enterprise Reliability',
+    'RBAC across the platform',
+  ]);
+
+  const automationDiffs = differentiators.filter((d) => automationDiffTitles.has(d.title));
+
+  return (
+    <div className="app">
+      <TopNav />
+
+      <header className="hero hero-compact">
+        <div className="hero-content">
+          <p className="eyebrow">Product</p>
+          <h1>SynaptaGrid Automation</h1>
+          <p className="hero-subtitle">
+            Workflows for anything — full control. Automation is sold separately, and it naturally integrates with EGAV when you use EGAV.
+            Manage your external systems and APIs, map your data (and/or EGAV entities) to activities,
+            then chain steps in a visual workflow builder to process data, trigger emails, call AI, or integrate any external API-accessible service.
+            Events can flow through API, Kafka, or SNS — and results can be written back to your systems (and optionally EGAV).
+          </p>
+          <div className="hero-actions">
+            <Link className="primary-button" to="/request-demo">
+              Schedule your technical review
+            </Link>
+            <Link className="secondary-button" to="/register">
+              Evaluate
+            </Link>
+          </div>
+        </div>
+      </header>
+
+      <main>
+        <section className="section">
+          <div className="section-header">
+            <h2>What Automation is</h2>
+            <p>
+              Push events to SynaptaGrid Automation, execute a governed workflow, and write results back to your systems.
+              Designed for product-grade reliability and operations — not one-off automations.
+            </p>
+          </div>
+          <div className="product-card">
+            <h3>{automation?.name ?? 'SynaptaGrid Automation'}</h3>
+            <p className="product-tagline">{automation?.tagline ?? 'Workflows for anything — full control'}</p>
+            <p>{automation?.description ?? 'Run state-aware workflows with operational control and auditability.'}</p>
+            {features.length > 0 && (
+              <ul>
+                {features.map((feature) => (
+                  <li key={feature}>{feature}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </section>
+
+        <section className="section alt">
+          <div className="section-header">
+            <h2>How Automation is organized</h2>
+            <p>
+              A clear separation of concerns: integrations and activities, entities and mappings, then a visual workflow builder that chains steps into durable execution.
+            </p>
+          </div>
+          <div className="products-grid">
+            {egavAutomationOrganization.map((part) => (
+              <div className="product-card" key={part.title}>
+                <h3>{part.title}</h3>
+                <p className="product-tagline">{part.tagline}</p>
+                <p>{part.description}</p>
+                <ul>
+                  {part.points.map((point) => (
+                    <li key={point}>{point}</li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="section alt" id="workflow">
+          <div className="section-header">
+            <h2>Example workflow</h2>
+            <p>Parallel activities, branching conditions, and human approvals in a single governed pipeline.</p>
+          </div>
+          <WorkflowVisualization />
+        </section>
+
+        <section className="section">
+          <div className="section-header">
+            <h2>What makes it different</h2>
+            <p>Unlimited activities, rich conditions, and operational control — built for your product roadmap.</p>
+          </div>
+          <div className="differentiators-grid">
+            {automationDiffs.map((diff) => (
+              <div className="differentiator-card" key={diff.title}>
+                <span className="diff-icon">{diff.icon}</span>
+                <div className="diff-content">
+                  <h3>{diff.title}</h3>
+                  <p>{diff.description}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="section cta">
+          <div>
+            <h2>See Automation on your architecture</h2>
+            <p>
+              Walk through your event sources, APIs, and governance needs — and see how SynaptaGrid runs and operates
+              workflows end-to-end.
+            </p>
+          </div>
+          <div className="cta-actions">
+            <Link className="primary-button" to="/request-demo">
+              Schedule your technical review
+            </Link>
+            <Link className="secondary-button" to="/contact-us">
+              Contact us
+            </Link>
+          </div>
+        </section>
+      </main>
+
+      <footer className="footer">
+        <p>SynaptaGrid — Automation infrastructure for SaaS</p>
+        <p className="footer-sub">Governed data. Reliable automation. Multi-tenant. White-label.</p>
+        <p className="footer-links">
+          <Link to="/contact-us">Contact us</Link>
+          <Link to="/request-demo">Schedule your technical review</Link>
+        </p>
+      </footer>
+    </div>
+  );
+}
+
 function LoginPage() {
   return (
     <div className="app">
+      <TopNav />
       <header className="hero hero-compact">
         <div className="hero-content">
           <p className="eyebrow">Welcome back</p>
@@ -1005,7 +2628,7 @@ function LoginPage() {
               type="button"
               onClick={() => startAuthRedirect('login')}
             >
-              Continue to Sign In
+              Continue to sign in
             </button>
             <p className="form-note" style={{ marginTop: '1rem' }}>
               Don't have an account? <Link to="/register">Start your free trial</Link>
@@ -1020,12 +2643,13 @@ function LoginPage() {
 function RegisterPage() {
   return (
     <div className="app">
+      <TopNav />
       <header className="hero hero-compact">
         <div className="hero-content">
-          <p className="eyebrow">Get started</p>
-          <h1>Start your free trial</h1>
+          <p className="eyebrow">Evaluate the platform</p>
+          <h1>Request access</h1>
           <p className="hero-subtitle">
-            Create your workspace and start building. No credit card required.
+            Create your workspace and explore the platform. No credit card required.
           </p>
           <Link className="secondary-button" to="/">
             Back to overview
@@ -1037,7 +2661,7 @@ function RegisterPage() {
         <section className="section form-section">
           <div className="section-header">
             <h2>Create your account</h2>
-            <p>Get started in under 2 minutes.</p>
+            <p>Evaluate the platform in minutes.</p>
           </div>
           <div className="form">
             <div className="trial-benefits">
@@ -1078,6 +2702,7 @@ function AuthCallbackPage() {
 
   const searchParams = useMemo(() => new URLSearchParams(location.search), [location.search]);
   const appBaseUrl = getAppBaseUrl();
+  const portalBaseUrl = getPortalBaseUrl();
 
   useEffect(() => {
     if (hasExchangedRef.current) {
@@ -1135,14 +2760,14 @@ function AuthCallbackPage() {
         }
         try {
           setAccessTokenCookie(tokens.access_token, tokens.expires_in);
+          if (tokens.refresh_token) {
+            setRefreshTokenCookie(tokens.refresh_token, tokens.refresh_expires_in ?? 1800);
+          }
         } catch {
           /* ignore */
         }
         if (data.access_hint?.action === 'personal_org_created' || data.access_hint?.action === 'ok') {
-          setMessage('Success! Redirecting...');
-          setTimeout(() => {
-            window.location.assign(appBaseUrl);
-          }, 1500);
+          setMessage('Success! You can go to the Portal when ready.');
         } else {
           setMessage('Additional action required.');
         }
@@ -1155,6 +2780,7 @@ function AuthCallbackPage() {
 
   return (
     <div className="app">
+      <TopNav />
       <header className="hero hero-compact">
         <div className="hero-content">
           <p className="eyebrow">Authentication</p>
@@ -1203,8 +2829,8 @@ function AuthCallbackPage() {
               ) : (
                 <>
                   <p>Your workspace is ready.</p>
-                  <a className="primary-button" href={appBaseUrl}>
-                    Go to Dashboard
+                  <a className="primary-button" href={portalBaseUrl}>
+                    Go to Portal
                   </a>
                 </>
               )}
@@ -1216,12 +2842,134 @@ function AuthCallbackPage() {
   );
 }
 
+function CaseStudiesPage() {
+  return (
+    <div className="app">
+      <TopNav />
+      <header className="hero hero-compact">
+        <div className="hero-content">
+          <p className="eyebrow">Target audience</p>
+          <h1>Case studies</h1>
+          <p className="hero-subtitle">
+            How teams in compliance-heavy, integration-heavy, and enterprise contexts use SynaptaGrid.
+          </p>
+          <Link className="secondary-button" to="/">
+            Back to overview
+          </Link>
+        </div>
+      </header>
+      <main>
+        <section className="section">
+          <div className="case-studies-grid">
+            {caseStudies.map((study) => (
+              <Link to={`/case-studies/${study.slug}`} className="case-study-card" key={study.slug}>
+                <span className="case-study-sector">{study.sector}</span>
+                <h3>{study.audience}</h3>
+                <p>{study.summary}</p>
+                <span className="case-study-link">Read more →</span>
+              </Link>
+            ))}
+          </div>
+        </section>
+      </main>
+      <footer className="footer">
+        <p>SynaptaGrid — Automation infrastructure for SaaS</p>
+        <p className="footer-sub">Governed data. Reliable automation. Multi-tenant. White-label.</p>
+        <p className="footer-links">
+          <Link to="/contact-us">Contact us</Link>
+          <Link to="/request-demo">Schedule your technical review</Link>
+        </p>
+      </footer>
+    </div>
+  );
+}
+
+function CaseStudyDetailPage() {
+  const { slug } = useParams<{ slug: string }>();
+  const study = caseStudies.find((s) => s.slug === slug);
+  if (!study) {
+    return (
+      <div className="app">
+        <TopNav />
+        <main>
+          <section className="section">
+            <div className="section-header">
+              <h2>Case study not found</h2>
+              <p>We couldn't find that case study.</p>
+              <Link to="/case-studies" className="primary-button">Back to case studies</Link>
+            </div>
+          </section>
+        </main>
+      </div>
+    );
+  }
+  return (
+    <div className="app">
+      <TopNav />
+      <header className="hero hero-compact">
+        <div className="hero-content">
+          <p className="eyebrow">{study.sector}</p>
+          <h1>{study.audience}</h1>
+          <p className="hero-subtitle">
+            How SynaptaGrid addressed this team's needs.
+          </p>
+          <Link className="secondary-button" to="/case-studies">
+            ← All case studies
+          </Link>
+        </div>
+      </header>
+      <main>
+        <section className="section">
+          <div className="case-study-detail">
+            <h2>Challenge</h2>
+            <p>{study.challenge}</p>
+            <h2>Solution</h2>
+            <p>{study.solution}</p>
+            <h2>Outcome</h2>
+            <p>{study.outcome}</p>
+            {study.quote && (
+              <blockquote className="case-study-quote">
+                "{study.quote}"
+              </blockquote>
+            )}
+            <Link to="/request-demo" className="primary-button">Schedule your technical review</Link>
+          </div>
+        </section>
+      </main>
+      <footer className="footer">
+        <p>SynaptaGrid — Automation infrastructure for SaaS</p>
+        <p className="footer-sub">Governed data. Reliable automation. Multi-tenant. White-label.</p>
+        <p className="footer-links">
+          <Link to="/contact-us">Contact us</Link>
+          <Link to="/request-demo">Schedule your technical review</Link>
+        </p>
+      </footer>
+    </div>
+  );
+}
+
+function ScrollToTop() {
+  const { pathname } = useLocation();
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+  }, [pathname]);
+  return null;
+}
+
 function App() {
+  useTokenRefresh();
   return (
     <BrowserRouter>
+      <ScrollToTop />
       <Routes>
         <Route path="/" element={<LandingPage />} />
+        <Route path="/egav" element={<EgavPage />} />
+        <Route path="/automation" element={<AutomationPage />} />
+        <Route path="/egav-automation" element={<AutomationPage />} />
+        <Route path="/case-studies" element={<CaseStudiesPage />} />
+        <Route path="/case-studies/:slug" element={<CaseStudyDetailPage />} />
         <Route path="/request-demo" element={<DemoRequestPage />} />
+        <Route path="/contact-us" element={<ContactUsPage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
         <Route path="/auth/callback" element={<AuthCallbackPage />} />
