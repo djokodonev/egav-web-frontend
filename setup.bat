@@ -13,6 +13,6 @@ echo.
 echo npm install
 echo npm start
 echo.
-echo The application will be available at http://localhost:3000
+echo The application will be available at https://www.local.synaptagrid.io:3200
 echo.
 pause

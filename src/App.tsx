@@ -9,11 +9,16 @@ import {
 import {
   exchangeCodeForTokens,
   startAuthRedirect,
+  redirectToGoogle,
+  redirectToGitHub,
+  redirectToTwitter,
+  redirectToMicrosoft,
 } from './auth/oidc';
 import type { TokenResponse } from './auth/oidc';
 import { useTokenRefresh } from './hooks/useTokenRefresh';
 import { useCaptcha } from './hooks/useCaptcha';
-import { getControlPlaneBaseUrl, SCHEDULE_DEMO_PATH, CONTACT_US_PATH } from './api/usersAccounts';
+import { getControlPlaneBaseUrl, getAuthnBaseUrl, SCHEDULE_DEMO_PATH, CONTACT_US_PATH } from './api/usersAccounts';
+import { BootstrapProvider, useBootstrap } from './contexts/BootstrapContext';
 
 /** IANA timezones for demo form (common + browser default first). */
 function getTimezoneOptions(): { value: string; label: string }[] {
@@ -78,14 +83,26 @@ type BootstrapResponse = {
 const MARKETING_USER_KEY = 'synaptagrid_marketing_user';
 const MARKETING_USER_FETCHED_AT_KEY = 'synaptagrid_marketing_user_fetched_at_ms';
 
+/** Parse tokens from AuthN central callback fragment (hash). AuthN social returns access_token only; Keycloak flow may include id_token. */
+function parseFragmentTokens(hash: string): { access_token: string; refresh_token?: string; expires_in: number; id_token?: string } | null {
+  if (!hash || !hash.startsWith('#')) return null;
+  const params = new URLSearchParams(hash.slice(1));
+  const access_token = params.get('access_token');
+  if (!access_token) return null;
+  const expires_in = parseInt(params.get('expires_in') ?? '3600', 10);
+  const refresh_token = params.get('refresh_token') ?? undefined;
+  const id_token = params.get('id_token') ?? undefined;
+  return { access_token, refresh_token, expires_in, id_token };
+}
+
 function getAppBaseUrl(): string {
   const env = process.env.REACT_APP_APP_BASE_URL;
   if (env) return env;
-  return `${window.location.protocol}//${window.location.hostname}:3001`;
+  return `${window.location.protocol}//${window.location.hostname}:3201`;
 }
 
 function getPortalBaseUrl(): string {
-  return process.env.REACT_APP_PORTAL_BASE_URL || 'https://local-app.synaptagrid.io:3003/';
+  return process.env.REACT_APP_PORTAL_BASE_URL || 'https://portal.local.synaptagrid.io:3203';
 }
 
 type CurrentUserResponse = {
@@ -116,8 +133,7 @@ function getStoredUserFetchedAtMs(): number | null {
 }
 
 async function fetchCurrentUser(): Promise<{ name: string; email?: string } | null> {
-  const authnBaseUrl =
-    process.env.REACT_APP_AUTHN_BASE_URL || 'https://local-app.synaptagrid.io:5005';
+  const authnBaseUrl = getAuthnBaseUrl();
   const mePath = process.env.REACT_APP_AUTHN_ME_PATH || '/v1/authn/me';
   const token = getAccessTokenCookie();
   const headers: Record<string, string> = {};
@@ -260,7 +276,7 @@ function TopNav({ user: userProp, authChecked: authCheckedProp }: { user?: TopNa
             </div>
           ) : (
             <div className="top-nav-auth-actions">
-              <Link to="/login" className="top-nav-link">Login</Link>
+              <a className="top-nav-link" href={`${getPortalBaseUrl().replace(/\/$/, '')}/login`}>Login</a>
               <Link to="/register" className="top-nav-link top-nav-cta">Evaluate</Link>
             </div>
           )}
@@ -296,7 +312,7 @@ function TopNav({ user: userProp, authChecked: authCheckedProp }: { user?: TopNa
             </div>
           ) : (
             <div className="top-nav-auth-actions">
-              <Link to="/login" className="top-nav-link">Login</Link>
+              <a className="top-nav-link" href={`${getPortalBaseUrl().replace(/\/$/, '')}/login`}>Login</a>
               <Link to="/register" className="top-nav-link top-nav-cta">Evaluate</Link>
             </div>
           )}
@@ -2599,7 +2615,57 @@ function AutomationPage() {
   );
 }
 
+const GoogleIcon = () => (
+  <span className="auth-social-icon" aria-hidden>
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+      <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+      <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+      <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+      <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+    </svg>
+  </span>
+);
+const GitHubIcon = () => (
+  <span className="auth-social-icon" aria-hidden>
+    <svg viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+      <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+    </svg>
+  </span>
+);
+const XIcon = () => (
+  <span className="auth-social-icon" aria-hidden>
+    <svg viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+      <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+    </svg>
+  </span>
+);
+const MicrosoftIcon = () => (
+  <span className="auth-social-icon" aria-hidden>
+    <svg viewBox="0 0 23 23" xmlns="http://www.w3.org/2000/svg">
+      <path fill="#f35325" d="M1 1h10v10H1z"/>
+      <path fill="#81bc06" d="M12 1h10v10H12z"/>
+      <path fill="#05a6f0" d="M1 12h10v10H1z"/>
+      <path fill="#ffba08" d="M12 12h10v10H12z"/>
+    </svg>
+  </span>
+);
+
 function LoginPage() {
+  const { config: bootstrapConfig } = useBootstrap();
+  const callbackUrl = `${window.location.origin}/auth/callback`;
+  const socialProviders = bootstrapConfig?.auth_provider?.social_providers ?? [];
+  const hasSocial = socialProviders.length > 0;
+  const [socialError, setSocialError] = useState<string | null>(null);
+
+  const handleSocialRedirect = async (fn: () => Promise<void>) => {
+    setSocialError(null);
+    try {
+      await fn();
+    } catch (e) {
+      setSocialError(e instanceof Error ? e.message : 'Sign-in failed. Try again.');
+    }
+  };
+
   return (
     <div className="app">
       <TopNav />
@@ -2620,16 +2686,41 @@ function LoginPage() {
         <section className="section form-section">
           <div className="section-header">
             <h2>Sign in</h2>
-            <p>Use your work credentials.</p>
+            <p>Use your work credentials or a social account.</p>
           </div>
           <div className="form">
-            <button
-              className="primary-button"
-              type="button"
-              onClick={() => startAuthRedirect('login')}
-            >
-              Continue to sign in
-            </button>
+            {socialError && (
+              <p className="form-error" role="alert">
+                {socialError}
+              </p>
+            )}
+            {hasSocial && (
+              <div className="auth-social-row">
+                {socialProviders.includes('google') && (
+                  <button type="button" className="auth-social-btn" onClick={() => handleSocialRedirect(() => redirectToGoogle(callbackUrl))}>
+                    <GoogleIcon /> Sign in with Google
+                  </button>
+                )}
+                {socialProviders.includes('github') && (
+                  <button type="button" className="auth-social-btn" onClick={() => handleSocialRedirect(() => redirectToGitHub(callbackUrl))}>
+                    <GitHubIcon /> Sign in with GitHub
+                  </button>
+                )}
+                {socialProviders.includes('twitter') && (
+                  <button type="button" className="auth-social-btn" onClick={() => handleSocialRedirect(() => redirectToTwitter(callbackUrl))}>
+                    <XIcon /> Sign in with X
+                  </button>
+                )}
+                {socialProviders.includes('microsoft') && (
+                  <button type="button" className="auth-social-btn" onClick={() => handleSocialRedirect(() => redirectToMicrosoft(callbackUrl))}>
+                    <MicrosoftIcon /> Sign in with Microsoft
+                  </button>
+                )}
+              </div>
+            )}
+            {!hasSocial && (
+              <p className="form-note">Sign in is available via Google, GitHub, Microsoft, or X when enabled for your organization.</p>
+            )}
             <p className="form-note" style={{ marginTop: '1rem' }}>
               Don't have an account? <Link to="/register">Start your free trial</Link>
             </p>
@@ -2641,6 +2732,20 @@ function LoginPage() {
 }
 
 function RegisterPage() {
+  const { config: bootstrapConfig } = useBootstrap();
+  const callbackUrl = `${window.location.origin}/auth/callback`;
+  const socialProviders = bootstrapConfig?.auth_provider?.social_providers ?? [];
+  const [socialError, setSocialError] = useState<string | null>(null);
+
+  const handleSocialRedirect = async (fn: () => Promise<void>) => {
+    setSocialError(null);
+    try {
+      await fn();
+    } catch (e) {
+      setSocialError(e instanceof Error ? e.message : 'Sign-in failed. Try again.');
+    }
+  };
+
   return (
     <div className="app">
       <TopNav />
@@ -2674,15 +2779,40 @@ function RegisterPage() {
                 <li>Email support</li>
               </ul>
             </div>
-            <button
-              className="primary-button"
-              type="button"
-              onClick={() => startAuthRedirect('register')}
-            >
-              Create Account
-            </button>
+            {socialError && (
+              <p className="form-error" role="alert">
+                {socialError}
+              </p>
+            )}
+            {socialProviders.length > 0 && (
+              <div className="auth-social-row">
+                {socialProviders.includes('google') && (
+                  <button type="button" className="auth-social-btn" onClick={() => handleSocialRedirect(() => redirectToGoogle(callbackUrl))}>
+                    <GoogleIcon /> Sign in with Google
+                  </button>
+                )}
+                {socialProviders.includes('github') && (
+                  <button type="button" className="auth-social-btn" onClick={() => handleSocialRedirect(() => redirectToGitHub(callbackUrl))}>
+                    <GitHubIcon /> Sign in with GitHub
+                  </button>
+                )}
+                {socialProviders.includes('twitter') && (
+                  <button type="button" className="auth-social-btn" onClick={() => handleSocialRedirect(() => redirectToTwitter(callbackUrl))}>
+                    <XIcon /> Sign in with X
+                  </button>
+                )}
+                {socialProviders.includes('microsoft') && (
+                  <button type="button" className="auth-social-btn" onClick={() => handleSocialRedirect(() => redirectToMicrosoft(callbackUrl))}>
+                    <MicrosoftIcon /> Sign in with Microsoft
+                  </button>
+                )}
+              </div>
+            )}
+            {socialProviders.length === 0 && (
+              <p className="form-note">Sign up is available via Google, GitHub, Microsoft, or X when enabled for your organization.</p>
+            )}
             <p className="form-note" style={{ marginTop: '1rem' }}>
-              Already have an account? <Link to="/login">Sign in</Link>
+              Already have an account? <a href={`${getPortalBaseUrl().replace(/\/$/, '')}/login`}>Sign in</a>
             </p>
           </div>
         </section>
@@ -2694,32 +2824,120 @@ function RegisterPage() {
 function AuthCallbackPage() {
   const location = useLocation();
   const navigate = useNavigate();
+  const { config: bootstrapConfig } = useBootstrap();
   const [status, setStatus] = useState<'loading' | 'error' | 'ready'>('loading');
   const [message, setMessage] = useState('Completing sign-in...');
   const [accessHint, setAccessHint] = useState<BootstrapResponse['access_hint'] | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [portalUrl, setPortalUrl] = useState<string | null>(null);
   const hasExchangedRef = useRef(false);
 
   const searchParams = useMemo(() => new URLSearchParams(location.search), [location.search]);
+  const hashTokens = useMemo(() => parseFragmentTokens(location.hash), [location.hash]);
   const appBaseUrl = getAppBaseUrl();
-  const portalBaseUrl = getPortalBaseUrl();
+  const defaultPortalUrl = getPortalBaseUrl();
 
   useEffect(() => {
-    if (hasExchangedRef.current) {
-      return;
-    }
+    if (hasExchangedRef.current) return;
 
+    // Error from AuthN or Keycloak (return_url?error=...)
     const error = searchParams.get('error');
+    const errorDescription = searchParams.get('error_description');
     const actionStatus = searchParams.get('kc_action_status');
     if (error || actionStatus === 'error') {
+      hasExchangedRef.current = true;
       setStatus('error');
-      setMessage('Authentication failed. Please try again.');
+      setMessage(errorDescription ? decodeURIComponent(errorDescription.replace(/\+/g, ' ')) : 'Authentication failed. Please try again.');
       return;
     }
 
+    // Case A: Fragment tokens (AuthN central callback, including social)
+    if (hashTokens) {
+      hasExchangedRef.current = true;
+      const authnBaseUrl = bootstrapConfig?.services?.authn_url || process.env.REACT_APP_AUTHN_BASE_URL || '';
+      const tokens = hashTokens;
+      try {
+        setAccessTokenCookie(tokens.access_token, tokens.expires_in);
+        if (tokens.refresh_token) {
+          setRefreshTokenCookie(tokens.refresh_token, 86400 * 30);
+        }
+      } catch {
+        /* ignore */
+      }
+      if (tokens.id_token && authnBaseUrl) {
+        // Keycloak flow: bootstrap/from-id-token for access_hint
+        fetch(`${authnBaseUrl}/v1/authn/bootstrap/from-id-token`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${tokens.access_token}`,
+          },
+          body: JSON.stringify({
+            id_token: tokens.id_token,
+          }),
+        })
+          .then(async (response) => {
+            if (!response.ok) throw new Error('Bootstrap failed');
+            const data = (await response.json()) as BootstrapResponse;
+            setAccessHint(data.access_hint);
+            setUserEmail(data.user.email);
+            setStatus('ready');
+            const u = data.user;
+            const displayName = (u as { display_name?: string }).display_name ?? (u as { name?: string }).name ?? u.email?.split('@')[0] ?? 'User';
+            try {
+              sessionStorage.setItem(MARKETING_USER_KEY, JSON.stringify({ name: displayName, email: u.email }));
+            } catch {
+              /* ignore */
+            }
+            setMessage(data.access_hint?.action === 'personal_org_created' || data.access_hint?.action === 'ok' ? 'Success! You can go to the Portal when ready.' : 'Additional action required.');
+          })
+          .catch(() => {
+            setStatus('error');
+            setMessage('Unable to complete sign-in. Please try again.');
+          });
+      } else {
+        // Social flow (no id_token): use /me for user display
+        if (authnBaseUrl) {
+          fetch(`${authnBaseUrl}/v1/authn/me`, {
+            headers: { Authorization: `Bearer ${tokens.access_token}` },
+          })
+            .then(async (res) => {
+              if (!res.ok) throw new Error('Me failed');
+              const data = (await res.json()) as CurrentUserResponse;
+              const email = data.user?.email ?? '';
+              const displayName = data.user?.display_name ?? data.user?.name ?? email?.split('@')[0] ?? 'User';
+              setUserEmail(email);
+              setAccessHint({ action: 'ok', reason: null });
+              setStatus('ready');
+              try {
+                sessionStorage.setItem(MARKETING_USER_KEY, JSON.stringify({ name: displayName, email }));
+              } catch {
+                /* ignore */
+              }
+              setMessage('Success! You can go to the Portal when ready.');
+            })
+            .catch(() => {
+              setUserEmail(null);
+              setAccessHint({ action: 'ok', reason: null });
+              setStatus('ready');
+              setMessage('Success! You can go to the Portal when ready.');
+            });
+        } else {
+          setAccessHint({ action: 'ok', reason: null });
+          setStatus('ready');
+          setMessage('Success! You can go to the Portal when ready.');
+        }
+      }
+      return;
+    }
+
+    // Case B: Query code + state (Keycloak direct)
+    if (!bootstrapConfig) {
+      setMessage('Loading configuration...');
+      return;
+    }
     const code = searchParams.get('code');
     const state = searchParams.get('state');
-
     if (!code || !state) {
       setStatus('error');
       setMessage('Missing authentication data.');
@@ -2727,9 +2945,8 @@ function AuthCallbackPage() {
     }
 
     hasExchangedRef.current = true;
-
-    const authnBaseUrl =
-      process.env.REACT_APP_AUTHN_BASE_URL || 'https://local-app.synaptagrid.io:5005';
+    const authnBaseUrl = bootstrapConfig.services.authn_url;
+    console.log('[Auth Callback] Using AuthN URL from bootstrap:', authnBaseUrl);
 
     exchangeCodeForTokens({ code, state })
       .then(async (tokens: TokenResponse) => {
@@ -2741,7 +2958,6 @@ function AuthCallbackPage() {
           },
           body: JSON.stringify({
             id_token: tokens.id_token,
-            create_personal_org_if_gmail: true,
           }),
         });
         if (!response.ok) {
@@ -2776,7 +2992,24 @@ function AuthCallbackPage() {
         setStatus('error');
         setMessage('Unable to complete sign-in. Please try again.');
       });
-  }, [appBaseUrl, navigate, searchParams]);
+  }, [hashTokens, searchParams, bootstrapConfig]);
+
+  // When we have an org (ok or personal_org_created), fetch that org's portal URL for "Go to Portal" link
+  useEffect(() => {
+    const guid = accessHint?.organization?.guid;
+    if (!guid || (accessHint?.action !== 'ok' && accessHint?.action !== 'personal_org_created')) {
+      return;
+    }
+    const cpBase = getControlPlaneBaseUrl();
+    fetch(`${cpBase}/v1/users-accounts/public/organizations/${encodeURIComponent(guid)}/portal`, { credentials: 'omit' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { portal_url?: string } | null) => {
+        if (data?.portal_url) setPortalUrl(data.portal_url);
+      })
+      .catch(() => {});
+  }, [accessHint?.organization?.guid, accessHint?.action]);
+
+  const portalLinkUrl = (portalUrl ?? defaultPortalUrl).replace(/\/$/, '');
 
   return (
     <div className="app">
@@ -2829,7 +3062,7 @@ function AuthCallbackPage() {
               ) : (
                 <>
                   <p>Your workspace is ready.</p>
-                  <a className="primary-button" href={portalBaseUrl}>
+                  <a className="primary-button" href={portalLinkUrl}>
                     Go to Portal
                   </a>
                 </>
@@ -2959,22 +3192,24 @@ function ScrollToTop() {
 function App() {
   useTokenRefresh();
   return (
-    <BrowserRouter>
-      <ScrollToTop />
-      <Routes>
-        <Route path="/" element={<LandingPage />} />
-        <Route path="/egav" element={<EgavPage />} />
-        <Route path="/automation" element={<AutomationPage />} />
-        <Route path="/egav-automation" element={<AutomationPage />} />
-        <Route path="/case-studies" element={<CaseStudiesPage />} />
-        <Route path="/case-studies/:slug" element={<CaseStudyDetailPage />} />
-        <Route path="/request-demo" element={<DemoRequestPage />} />
-        <Route path="/contact-us" element={<ContactUsPage />} />
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="/register" element={<RegisterPage />} />
-        <Route path="/auth/callback" element={<AuthCallbackPage />} />
-      </Routes>
-    </BrowserRouter>
+    <BootstrapProvider>
+      <BrowserRouter>
+        <ScrollToTop />
+        <Routes>
+          <Route path="/" element={<LandingPage />} />
+          <Route path="/egav" element={<EgavPage />} />
+          <Route path="/automation" element={<AutomationPage />} />
+          <Route path="/egav-automation" element={<AutomationPage />} />
+          <Route path="/case-studies" element={<CaseStudiesPage />} />
+          <Route path="/case-studies/:slug" element={<CaseStudyDetailPage />} />
+          <Route path="/request-demo" element={<DemoRequestPage />} />
+          <Route path="/contact-us" element={<ContactUsPage />} />
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/register" element={<RegisterPage />} />
+          <Route path="/auth/callback" element={<AuthCallbackPage />} />
+        </Routes>
+      </BrowserRouter>
+    </BootstrapProvider>
   );
 }
 
