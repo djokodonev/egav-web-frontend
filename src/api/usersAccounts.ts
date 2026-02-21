@@ -19,13 +19,10 @@ export function getControlPlaneBaseUrl(): string {
   );
 }
 
-// Helper to get AuthN URL from bootstrap (for authenticated endpoints)
+// AuthN URL from bootstrap only (no env fallback).
 export function getAuthnBaseUrl(): string {
   const config = getBootstrapConfig();
-  if (config?.services?.authn_url) {
-    return config.services.authn_url;
-  }
-  return process.env.REACT_APP_AUTHN_BASE_URL || 'https://authn-api.local.synaptagrid.io:5209';
+  return config?.services?.authn_url ?? '';
 }
 
 export type CaptchaConfigResponse = {

@@ -26,7 +26,7 @@ export type BootstrapConfig = {
   services: {
     authn_url: string;
     authz_url: string;
-    keycloak_url: string;
+    idp_url: string;
     region: string;
   };
   auth: {
@@ -35,7 +35,7 @@ export type BootstrapConfig = {
   };
   // OAuth/OIDC Provider Configuration
   auth_provider?: {
-    provider_type: string;  // 'keycloak', 'workos', 'auth0', etc.
+    provider_type: string;  // 'oidc', 'workos', 'auth0', etc.
     issuer: string;
     authorization_endpoint: string;
     token_endpoint: string;
@@ -52,7 +52,7 @@ export type BootstrapConfig = {
     sso_required: boolean;
     sso_button_text: string | null;
     allow_social_login: boolean;
-    kc_idp_hint?: string;  // Keycloak IDP hint
+    kc_idp_hint?: string;  // IdP hint (when IdP supports it)
     workos_connection_id?: string;  // WorkOS specific
     workos_organization_id?: string;  // WorkOS specific
   };
@@ -82,10 +82,11 @@ export const BootstrapProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       
       console.log('[Bootstrap] Loading config for hostname:', hostname);
 
-      // Call bootstrap endpoint (NO AUTH REQUIRED - public endpoint)
-      const controlPlaneUrl = process.env.REACT_APP_CONTROL_PLANE_BASE_URL || 
-                              'https://api.local.synaptagrid.io:5207';
-      
+      // Only URL from env: Control Plane (bootstrap). All other URLs come from bootstrap response.
+      const controlPlaneUrl = process.env.REACT_APP_CONTROL_PLANE_BASE_URL;
+      if (!controlPlaneUrl) {
+        throw new Error('REACT_APP_CONTROL_PLANE_BASE_URL is required');
+      }
       const url = `${controlPlaneUrl}/v1/users-accounts/public/bootstrap?hostname=${encodeURIComponent(hostname)}`;
       console.log('[Bootstrap] Fetching from:', url);
 
@@ -117,29 +118,7 @@ export const BootstrapProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     } catch (err: any) {
       console.error('[Bootstrap] Failed to load config:', err);
       setError(err.message);
-      
-      // Fallback to environment variables if bootstrap fails
-      console.warn('[Bootstrap] Using fallback configuration from environment variables');
-      const fallbackConfig: BootstrapConfig = {
-        organization: {
-          guid: '',
-          slug: 'synaptagrid',
-          name: 'SynaptaGrid',
-          type: 'system',
-          subdomain: null,
-        },
-        services: {
-          authn_url: process.env.REACT_APP_AUTHN_BASE_URL || 'https://authn-api.local.synaptagrid.io:5209',
-          authz_url: process.env.REACT_APP_AUTHZ_BASE_URL || 'https://authz-api.local.synaptagrid.io:5206',
-          keycloak_url: process.env.REACT_APP_OIDC_ISSUER?.split('/realms/')[0] || 'https://keycloak.local.synaptagrid.io:5281',
-          region: 'us-east-1',
-        },
-        auth: {
-          sso_config_url: '',
-          auth_config_url: '',
-        },
-      };
-      setConfig(fallbackConfig);
+      setConfig(null);
     } finally {
       setLoading(false);
     }

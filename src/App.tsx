@@ -83,7 +83,7 @@ type BootstrapResponse = {
 const MARKETING_USER_KEY = 'synaptagrid_marketing_user';
 const MARKETING_USER_FETCHED_AT_KEY = 'synaptagrid_marketing_user_fetched_at_ms';
 
-/** Parse tokens from AuthN central callback fragment (hash). AuthN social returns access_token only; Keycloak flow may include id_token. */
+/** Parse tokens from AuthN central callback fragment (hash). AuthN social returns access_token only; OIDC/IdP flow may include id_token. */
 function parseFragmentTokens(hash: string): { access_token: string; refresh_token?: string; expires_in: number; id_token?: string } | null {
   if (!hash || !hash.startsWith('#')) return null;
   const params = new URLSearchParams(hash.slice(1));
@@ -829,7 +829,7 @@ const techStack = [
     logo: "https://cdn.jsdelivr.net/gh/devicons/devicon/icons/react/react-original.svg"
   },
   { 
-    name: "Keycloak", 
+    name: "Identity (IdP)", 
     role: "Bridges our platform with your users",
     logo: "https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/keycloak.svg"
   },
@@ -870,7 +870,7 @@ const techStack = [
   },
 ];
 
-const keycloakFeatures = [
+const idpFeatures = [
   { title: "Single Sign-On (SSO)", description: "Your users sign in once and access all connected applications. Single sign-out supported." },
   { title: "OpenID Connect, OAuth 2.0, SAML 2.0", description: "Standard protocols so your apps and services plug into your existing identity strategy." },
   { title: "Identity brokering & social login", description: "Connect to your IdP or social providers (Google, GitHub, etc.) so your users use the logins they already have." },
@@ -1847,7 +1847,7 @@ function LandingPage() {
           <div className="section-header">
             <h2>Stack you can rely on</h2>
             <p>
-              We host on AWS. Proven, enterprise-grade components — React, Keycloak, Temporal, PostgreSQL, and more. Lower risk, easier to defend in architecture review.
+              We host on AWS. Proven, enterprise-grade components — React, Identity (IdP), Temporal, PostgreSQL, and more. Lower risk, easier to defend in architecture review.
             </p>
           </div>
           <div className="tech-grid">
@@ -1860,14 +1860,14 @@ function LandingPage() {
             ))}
           </div>
 
-          <div className="keycloak-features">
-            <h3>Keycloak: bridge between our system and your users</h3>
-            <p className="keycloak-features-intro">
-              We use Keycloak to connect our platform to your users and your identity stack. You get the well-known features you expect from a modern IdP.
+          <div className="idp-features">
+            <h3>Identity provider: bridge between our system and your users</h3>
+            <p className="idp-features-intro">
+              We use an identity provider (IdP) to connect our platform to your users and your identity stack. You get the well-known features you expect from a modern IdP.
             </p>
-            <div className="keycloak-features-grid">
-              {keycloakFeatures.map((f) => (
-                <div className="keycloak-feature-card" key={f.title}>
+            <div className="idp-features-grid">
+              {idpFeatures.map((f) => (
+                <div className="idp-feature-card" key={f.title}>
                   <h4>{f.title}</h4>
                   <p>{f.description}</p>
                 </div>
@@ -2840,7 +2840,7 @@ function AuthCallbackPage() {
   useEffect(() => {
     if (hasExchangedRef.current) return;
 
-    // Error from AuthN or Keycloak (return_url?error=...)
+    // Error from AuthN or IdP (return_url?error=...)
     const error = searchParams.get('error');
     const errorDescription = searchParams.get('error_description');
     const actionStatus = searchParams.get('kc_action_status');
@@ -2854,7 +2854,7 @@ function AuthCallbackPage() {
     // Case A: Fragment tokens (AuthN central callback, including social)
     if (hashTokens) {
       hasExchangedRef.current = true;
-      const authnBaseUrl = bootstrapConfig?.services?.authn_url || process.env.REACT_APP_AUTHN_BASE_URL || '';
+      const authnBaseUrl = bootstrapConfig?.services?.authn_url ?? '';
       const tokens = hashTokens;
       try {
         setAccessTokenCookie(tokens.access_token, tokens.expires_in);
@@ -2865,7 +2865,7 @@ function AuthCallbackPage() {
         /* ignore */
       }
       if (tokens.id_token && authnBaseUrl) {
-        // Keycloak flow: bootstrap/from-id-token for access_hint
+        // OIDC flow: bootstrap/from-id-token for access_hint
         fetch(`${authnBaseUrl}/v1/authn/bootstrap/from-id-token`, {
           method: 'POST',
           headers: {
@@ -2931,7 +2931,7 @@ function AuthCallbackPage() {
       return;
     }
 
-    // Case B: Query code + state (Keycloak direct)
+    // Case B: Query code + state (OIDC direct)
     if (!bootstrapConfig) {
       setMessage('Loading configuration...');
       return;

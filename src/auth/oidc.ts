@@ -12,43 +12,31 @@ export type TokenResponse = {
   scope?: string;
 };
 
-// Get dynamic configuration from bootstrap or fallback to env
+// All auth/OIDC URLs from bootstrap only (only Control Plane URL is from env).
 function getOidcIssuer(): string {
   const config = getBootstrapConfig();
-  // Use auth_provider.issuer if available (includes realm)
-  if (config?.auth_provider?.issuer) {
-    return config.auth_provider.issuer;
-  }
-  // Fallback to constructing from keycloak_url
-  if (config?.services?.keycloak_url) {
-    return `${config.services.keycloak_url}/realms/synaptagrid`;
-  }
-  // Final fallback to environment variable
-  return process.env.REACT_APP_OIDC_ISSUER || 'http://host.docker.internal:5281/realms/synaptagrid';
+  return config?.auth_provider?.issuer ?? '';
 }
 
 function getOidcClientId(): string {
   const config = getBootstrapConfig();
-  if (config?.auth_provider?.client_id) {
-    return config.auth_provider.client_id;
-  }
-  return 'synaptagrid-local';
+  return config?.auth_provider?.client_id ?? '';
 }
 
 const STORAGE_STATE_KEY = 'synaptagrid_oidc_state';
 const STORAGE_VERIFIER_KEY = 'synaptagrid_oidc_verifier';
 
-/** Redirect URI sent to IdP. Must be AuthN central callback so Keycloak/Google/GitHub accept it; final app URL is in state. Prefer oauth_callback_url (AuthN central) so we never use the app's own callback URL by mistake. */
+/** Redirect URI from bootstrap only (AuthN central callback; final app URL is in state). */
 function getRedirectUri(): string {
   const config = getBootstrapConfig();
-  const redirect = config?.auth_provider?.oauth_callback_url ?? config?.auth_provider?.redirect_uri;
+  const redirect = config?.auth_provider?.redirect_uri;
   if (redirect && typeof redirect === 'string' && redirect.trim()) return redirect.trim();
   const authnBase = config?.services?.authn_url;
   if (authnBase && typeof authnBase === 'string' && authnBase.trim()) {
     const base = authnBase.trim().replace(/\/+\s*$/, '');
     return `${base}/v1/authn/oauth/callback`;
   }
-  return process.env.REACT_APP_OIDC_REDIRECT_URI || `${window.location.origin}/auth/callback`;
+  return '';
 }
 
 function randomString(size = 32) {
@@ -120,7 +108,7 @@ type LoginResponse = { authorization_url: string };
 
 async function fetchAuthUrl(provider: 'google' | 'github' | 'twitter' | 'microsoft', returnUrl: string): Promise<string> {
   const config = getBootstrapConfig();
-  const authnUrl = (config?.services?.authn_url || process.env.REACT_APP_AUTHN_BASE_URL || '').replace(/\/$/, '');
+  const authnUrl = (config?.services?.authn_url ?? '').replace(/\/$/, '');
   if (!authnUrl) {
     throw new Error('AuthN URL not configured');
   }
@@ -188,8 +176,11 @@ export async function startAuthRedirect(mode: AuthMode) {
   sessionStorage.setItem(STORAGE_STATE_KEY, state);
   sessionStorage.setItem(STORAGE_VERIFIER_KEY, verifier);
 
-  const OIDC_ISSUER = getOidcIssuer();
-  const AUTH_ENDPOINT = `${OIDC_ISSUER}/protocol/openid-connect/auth`;
+  const config = getBootstrapConfig();
+  const AUTH_ENDPOINT = config?.auth_provider?.authorization_endpoint ?? '';
+  if (!AUTH_ENDPOINT) {
+    throw new Error('Authorization endpoint not available. Check bootstrap config.');
+  }
   
   const params = buildAuthParams({ mode, state, codeChallenge: challenge });
   params.set('code_challenge_method', method);
@@ -212,8 +203,11 @@ export async function exchangeCodeForTokens({
     throw new Error('Invalid auth state');
   }
 
-  const OIDC_ISSUER = getOidcIssuer();
-  const TOKEN_ENDPOINT = `${OIDC_ISSUER}/protocol/openid-connect/token`;
+  const config = getBootstrapConfig();
+  const TOKEN_ENDPOINT = config?.auth_provider?.token_endpoint ?? '';
+  if (!TOKEN_ENDPOINT) {
+    throw new Error('Token endpoint not available. Check bootstrap config.');
+  }
 
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
@@ -240,8 +234,11 @@ export async function exchangeCodeForTokens({
 }
 
 export async function refreshAccessToken(refreshToken: string): Promise<TokenResponse> {
-  const OIDC_ISSUER = getOidcIssuer();
-  const TOKEN_ENDPOINT = `${OIDC_ISSUER}/protocol/openid-connect/token`;
+  const config = getBootstrapConfig();
+  const TOKEN_ENDPOINT = config?.auth_provider?.token_endpoint ?? '';
+  if (!TOKEN_ENDPOINT) {
+    throw new Error('Token endpoint not available.');
+  }
   
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
@@ -258,4 +255,48 @@ export async function refreshAccessToken(refreshToken: string): Promise<TokenRes
   }
   const data = (await response.json()) as TokenResponse;
   return data;
+}
+
+export type CredentialsLoginResponse = {
+  access_token: string;
+  refresh_token?: string;
+  token_type: string;
+  expires_in: number;
+  user_guid: string;
+  org_guid: string;
+  email: string;
+  role?: string;
+  org_name?: string;
+};
+
+/**
+ * Login with email + password via AuthN (no IdP page). AuthN authenticates
+ * against the IdP server-side and returns enriched tokens.
+ * Passes client_id and hostname from bootstrap so AuthN fetches IdP credentials from Control Plane.
+ */
+export async function loginWithCredentials(email: string, password: string): Promise<CredentialsLoginResponse> {
+  const config = getBootstrapConfig();
+  const authnUrl = (config?.services?.authn_url ?? '').replace(/\/$/, '');
+  if (!authnUrl) {
+    throw new Error('AuthN service not available.');
+  }
+  const body: { email: string; password: string; client_id?: string; hostname?: string } = { email, password };
+  if (config?.auth_provider?.client_id) body.client_id = config.auth_provider.client_id;
+  if (typeof window !== 'undefined' && window.location?.hostname) body.hostname = window.location.hostname;
+  const response = await fetch(`${authnUrl}/v1/authn/login/credentials`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    let message = 'Sign-in failed. Check your email and password.';
+    try {
+      const err = await response.json();
+      if (err.detail && typeof err.detail === 'string' && err.detail.length < 300) {
+        message = err.detail;
+      }
+    } catch { /* use default */ }
+    throw new Error(message);
+  }
+  return (await response.json()) as CredentialsLoginResponse;
 }

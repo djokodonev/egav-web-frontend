@@ -658,7 +658,7 @@ body {
 .section > .audience-grid,
 .section > .case-studies-grid,
 .section > .tech-grid,
-.section > .keycloak-features,
+.section > .idp-features,
 .section > .dag-workflow,
 .section > div:first-child,
 .section > .cta-actions {
@@ -1403,49 +1403,49 @@ body {
 }
 
 /* ========================================
-   Keycloak Features
+   IdP Features
    ======================================== */
-.keycloak-features {
+.idp-features {
   margin-top: 3rem;
   padding-top: 2.5rem;
   border-top: 1px solid var(--color-border);
 }
 
-.keycloak-features h3 {
+.idp-features h3 {
   margin: 0 0 0.5rem;
   font-size: 1.35rem;
   font-weight: 700;
   color: var(--color-text-primary);
 }
 
-.keycloak-features-intro {
+.idp-features-intro {
   margin: 0 0 1.5rem;
   color: var(--color-text-secondary);
   font-size: 0.95rem;
   line-height: 1.6;
 }
 
-.keycloak-features-grid {
+.idp-features-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 1rem;
 }
 
-.keycloak-feature-card {
+.idp-feature-card {
   background: #ffffff;
   border-radius: var(--radius-md);
   padding: 1.25rem;
   border: 1px solid var(--color-border);
 }
 
-.keycloak-feature-card h4 {
+.idp-feature-card h4 {
   margin: 0 0 0.5rem;
   font-size: 0.95rem;
   font-weight: 600;
   color: var(--color-text-primary);
 }
 
-.keycloak-feature-card p {
+.idp-feature-card p {
   margin: 0;
   font-size: 0.85rem;
   color: var(--color-text-secondary);
@@ -2455,7 +2455,7 @@ body {
     grid-template-columns: repeat(3, 1fr);
   }
   
-  .keycloak-features-grid {
+  .idp-features-grid {
     grid-template-columns: repeat(2, 1fr);
   }
   
@@ -2580,7 +2580,7 @@ body {
     grid-template-columns: repeat(2, 1fr);
   }
   
-  .keycloak-features-grid {
+  .idp-features-grid {
     grid-template-columns: 1fr;
   }
   
